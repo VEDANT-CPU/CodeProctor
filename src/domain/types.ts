@@ -1,8 +1,9 @@
+import type { SessionStatus } from './session'
+
 /** Application roles used by CodeProctor's domain authorization rules. */
 export type Role = 'candidate' | 'proctor'
 
-/** Lifecycle states for one candidate's assessment session. */
-export type SessionStatus = 'pending' | 'active' | 'submitted' | 'terminated'
+export type { SessionStatus } from './session'
 
 /**
  * Verified application identity and, when available, the session assigned to

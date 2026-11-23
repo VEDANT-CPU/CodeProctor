@@ -7,7 +7,7 @@ import type {
   SessionStatus,
 } from './types'
 
-const terminalStatuses: readonly SessionStatus[] = ['submitted', 'terminated']
+const terminalStatuses: readonly SessionStatus[] = ['submitted', 'timed_out']
 
 const proctorActions: readonly SessionAction[] = [
   'view_assessment',
@@ -78,8 +78,8 @@ export function canCandidateMutateSession(
 
 /**
  * Checks an allowed lifecycle transition. Candidates may submit their active
- * session; proctors may activate a pending session or terminate a pending or
- * active session. Submitted and terminated sessions are immutable.
+ * session; proctors may activate a pending session or time out a pending or
+ * active session. Submitted and timed-out sessions are immutable.
  */
 export function canTransitionSessionStatus(
   actor: ActorContext,
@@ -96,9 +96,9 @@ export function canTransitionSessionStatus(
 
   if (actor.role !== 'proctor') return false
   if (session.status === 'pending') {
-    return nextStatus === 'active' || nextStatus === 'terminated'
+    return nextStatus === 'active' || nextStatus === 'timed_out'
   }
-  return session.status === 'active' && nextStatus === 'terminated'
+  return session.status === 'active' && nextStatus === 'timed_out'
 }
 
 function isCandidateMutation(action: SessionAction): action is CandidateMutation {

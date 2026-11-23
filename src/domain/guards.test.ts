@@ -48,17 +48,17 @@ describe('session access guards', () => {
     for (const mutation of ['edit_code', 'run_tests', 'append_telemetry', 'submit_solution'] as const) {
       expect(canCandidateMutateSession(candidate, session('active'), mutation)).toBe(true)
       expect(canCandidateMutateSession(candidate, session('submitted'), mutation)).toBe(false)
-      expect(canCandidateMutateSession(candidate, session('terminated'), mutation)).toBe(false)
+      expect(canCandidateMutateSession(candidate, session('timed_out'), mutation)).toBe(false)
     }
 
-    expect(canPerformAction(candidate, 'view_session', session('terminated'))).toBe(true)
+    expect(canPerformAction(candidate, 'view_session', session('timed_out'))).toBe(true)
     expect(canPerformAction(candidate, 'view_assessment', session('submitted'))).toBe(false)
   })
 
   it('allows proctor review actions on completed sessions and creation without a session', () => {
-    expect(canPerformAction(proctor, 'view_session', session('terminated'))).toBe(true)
+    expect(canPerformAction(proctor, 'view_session', session('timed_out'))).toBe(true)
     expect(canPerformAction(proctor, 'scrub_timeline', session('submitted'))).toBe(true)
-    expect(canPerformAction(proctor, 'add_session_note', session('terminated'))).toBe(true)
+    expect(canPerformAction(proctor, 'add_session_note', session('timed_out'))).toBe(true)
     expect(canPerformAction(proctor, 'request_ai_overview', session('submitted'))).toBe(true)
     expect(canPerformAction(proctor, 'set_final_disposition', session('submitted'))).toBe(true)
     expect(canPerformAction(proctor, 'create_assessment_session')).toBe(true)
@@ -66,19 +66,19 @@ describe('session access guards', () => {
 })
 
 describe('session lifecycle guards', () => {
-  it('treats submitted and terminated sessions as terminal', () => {
+  it('treats submitted and timed-out sessions as terminal', () => {
     expect(isTerminalSessionStatus('submitted')).toBe(true)
-    expect(isTerminalSessionStatus('terminated')).toBe(true)
+    expect(isTerminalSessionStatus('timed_out')).toBe(true)
     expect(isTerminalSessionStatus('pending')).toBe(false)
     expect(isTerminalSessionStatus('active')).toBe(false)
   })
 
-  it('allows candidate submission and proctor activation or termination only', () => {
+  it('allows candidate submission and proctor activation or timeout only', () => {
     expect(canTransitionSessionStatus(candidate, session('active'), 'submitted')).toBe(true)
-    expect(canTransitionSessionStatus(candidate, session('active'), 'terminated')).toBe(false)
+    expect(canTransitionSessionStatus(candidate, session('active'), 'timed_out')).toBe(false)
     expect(canTransitionSessionStatus(proctor, session('pending'), 'active')).toBe(true)
-    expect(canTransitionSessionStatus(proctor, session('active'), 'terminated')).toBe(true)
+    expect(canTransitionSessionStatus(proctor, session('active'), 'timed_out')).toBe(true)
     expect(canTransitionSessionStatus(proctor, session('submitted'), 'active')).toBe(false)
-    expect(canTransitionSessionStatus(proctor, session('terminated'), 'active')).toBe(false)
+    expect(canTransitionSessionStatus(proctor, session('timed_out'), 'active')).toBe(false)
   })
 })
