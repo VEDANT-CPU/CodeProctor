@@ -3,6 +3,7 @@ export type TelemetryEventType =
   | 'FOCUS_LOST'
   | 'FOCUS_RESTORED'
   | 'LARGE_PASTE'
+  | 'CODE_EDIT'
   | 'TEST_RUN'
   | 'CONNECTION_LOST'
   | 'CONNECTION_RECOVERED'
@@ -31,6 +32,14 @@ export interface LargePastePayload {
   lineCount: number
   /** Origin reported by the editor, when available. */
   source?: 'clipboard' | 'unknown'
+}
+
+/** Size of a code edit used to establish coding activity and insertion bursts. */
+export interface CodeEditPayload {
+  /** Number of characters inserted by this edit. */
+  insertedCharacterCount: number
+  /** Number of characters deleted by this edit. */
+  deletedCharacterCount: number
 }
 
 /** Result metadata for a curated test suite run. */
@@ -66,6 +75,7 @@ export interface TelemetryPayloadByType {
   FOCUS_LOST: FocusLostPayload
   FOCUS_RESTORED: FocusRestoredPayload
   LARGE_PASTE: LargePastePayload
+  CODE_EDIT: CodeEditPayload
   TEST_RUN: TestRunPayload
   CONNECTION_LOST: ConnectionLostPayload
   CONNECTION_RECOVERED: ConnectionRecoveredPayload
