@@ -12,8 +12,13 @@ export type ReviewDisposition =
   /** Reviewer marked the session or signal for follow-up. */
   | 'flagged'
 
-/** Exact location in a session timeline, using epoch milliseconds. */
+/**
+ * Stable session-scoped location in a timeline. `(sessionId, seq)` identifies
+ * the timeline record; timestamp is retained for audit and display.
+ */
 export interface TimelineAnchor {
+  /** Assessment session containing this timeline position. */
+  sessionId: string
   /** Session-scoped sequence number of the referenced timeline position. */
   seq: number
   /** Timestamp for that position as Unix epoch milliseconds. */
@@ -43,10 +48,11 @@ export type IncidentCitation =
       snapshotId: string
     })
   | (IncidentCitationBase & {
-      /** Citation refers to a code change or reconstructed diff. */
+      /**
+       * Citation refers to the CODE_EDIT delta identified by `(sessionId, seq)`.
+       * No separate diff ID is needed for an edit already stored in the timeline.
+       */
       source: 'code_diff'
-      /** Stable identifier of the cited diff. */
-      diffId: string
     })
 
 /**
