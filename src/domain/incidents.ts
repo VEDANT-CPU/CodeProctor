@@ -376,7 +376,7 @@ function addIdleGapIncident(
   const insertedCharacterCount =
     event.type === 'LARGE_PASTE'
       ? event.payload.characterCount
-      : event.payload.insertedCharacterCount
+      : event.payload.insertText.length
 
   if (
     idleGapMs <= config.idleGapThenBurst.minimumIdleGapMs ||

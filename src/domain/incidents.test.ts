@@ -53,7 +53,11 @@ function codeEdit(
     seq,
     clientTimestamp,
     type: 'CODE_EDIT',
-    payload: { insertedCharacterCount, deletedCharacterCount: 0 },
+    payload: {
+      start: 0,
+      deleteCount: 0,
+      insertText: 'x'.repeat(insertedCharacterCount),
+    },
   }
 }
 

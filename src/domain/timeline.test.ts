@@ -21,16 +21,23 @@ function delta(
   deleteCount: number,
   insertText: string,
   deletedText?: string,
-): CodeDelta {
-  return {
-    kind: 'code_delta',
+): TimelinePoint {
+  const event: CodeDelta = {
     sessionId: 'session-a',
     seq,
     clientTimestamp: seq * 1_000,
-    start,
-    deleteCount,
-    insertText,
-    ...(deletedText === undefined ? {} : { deletedText }),
+    type: 'CODE_EDIT',
+    payload: {
+      start,
+      deleteCount,
+      insertText,
+      ...(deletedText === undefined ? {} : { deletedText }),
+    },
+  }
+
+  return {
+    ...event,
+    kind: 'telemetry',
   }
 }
 
@@ -75,7 +82,7 @@ function telemetry(
 }
 
 describe('timeline reconstruction', () => {
-  it('starts from the nearest snapshot and applies later code deltas in sequence order', () => {
+  it('starts from the nearest snapshot and applies CODE_EDIT patches by their shared sequence', () => {
     const points: TimelinePoint[] = [
       snapshot(1, 'old code'),
       delta(2, 0, 8, 'ignored'),
@@ -124,6 +131,13 @@ describe('timeline reconstruction', () => {
     expect(() =>
       reconstructTimeline({
         points: [snapshot(1, 'abc'), snapshot(1, 'other')],
+        cursor: { by: 'seq', value: 1 },
+      }),
+    ).toThrow('Duplicate timeline sequence: 1')
+
+    expect(() =>
+      reconstructTimeline({
+        points: [snapshot(1, 'abc'), delta(1, 0, 0, 'x')],
         cursor: { by: 'seq', value: 1 },
       }),
     ).toThrow('Duplicate timeline sequence: 1')

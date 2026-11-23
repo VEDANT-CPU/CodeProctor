@@ -27,36 +27,20 @@ export interface CodeSnapshot {
   code: string
 }
 
-/** Single source edit applied to code between full snapshots. */
-export interface CodeDelta {
-  /** Discriminator for an incremental code change. */
-  kind: 'code_delta'
-  /** Assessment session that owns this edit. */
-  sessionId: string
-  /** Session-scoped sequence number, starting at 1. */
-  seq: number
-  /** Client-observed edit time in Unix epoch milliseconds. */
-  clientTimestamp: number
-  /** Server receive time in Unix epoch milliseconds, when ingested. */
-  serverReceivedAt?: number
-  /** Zero-based UTF-16 offset, matching browser editor selection APIs. */
-  start: number
-  /** Number of UTF-16 code units removed at `start`. */
-  deleteCount: number
-  /** Optional removed text, used to detect applying a delta to the wrong state. */
-  deletedText?: string
-  /** Text inserted at `start` after the deletion. */
-  insertText: string
-}
-
 /** Telemetry timeline point, retaining its typed event and shared sequence. */
 export type TelemetryTimelinePoint = TelemetryEvent & {
   /** Discriminator for browser telemetry. */
   kind: 'telemetry'
 }
 
-/** Full snapshots, code deltas, and telemetry in one ordered session timeline. */
-export type TimelinePoint = CodeSnapshot | CodeDelta | TelemetryTimelinePoint
+/**
+ * A code delta is the existing CODE_EDIT telemetry event, not a second event.
+ * The patch and its unique `(sessionId, seq)` are carried together.
+ */
+export type CodeDelta = Extract<TelemetryEvent, { type: 'CODE_EDIT' }>
+
+/** Full snapshots and telemetry events in one sequence-ordered session timeline. */
+export type TimelinePoint = CodeSnapshot | TelemetryTimelinePoint
 
 /** Cursor for deterministic scrubbing by sequence number or client time. */
 export type TimelineCursor =
@@ -210,7 +194,7 @@ function reconstructCodeAndFlags(points: readonly TimelinePoint[]): {
   for (const point of codePoints) {
     if (point.kind === 'snapshot') {
       code = point.code
-    } else if (point.kind === 'code_delta') {
+    } else if (point.kind === 'telemetry' && point.type === 'CODE_EDIT') {
       code = applyCodeDelta(code, point)
     }
   }
@@ -219,21 +203,22 @@ function reconstructCodeAndFlags(points: readonly TimelinePoint[]): {
 }
 
 function applyCodeDelta(code: string, delta: CodeDelta): string {
-  const end = delta.start + delta.deleteCount
+  const { start, deleteCount, deletedText, insertText } = delta.payload
+  const end = start + deleteCount
   if (
-    !Number.isSafeInteger(delta.start) ||
-    !Number.isSafeInteger(delta.deleteCount) ||
-    delta.start < 0 ||
-    delta.deleteCount < 0 ||
+    !Number.isSafeInteger(start) ||
+    !Number.isSafeInteger(deleteCount) ||
+    start < 0 ||
+    deleteCount < 0 ||
     end > code.length
   ) {
     throw new RangeError(`Invalid code delta at sequence ${delta.seq}`)
   }
-  if (delta.deletedText !== undefined && code.slice(delta.start, end) !== delta.deletedText) {
+  if (deletedText !== undefined && code.slice(start, end) !== deletedText) {
     throw new Error(`Code delta does not match reconstructed state at sequence ${delta.seq}`)
   }
 
-  return code.slice(0, delta.start) + delta.insertText + code.slice(end)
+  return code.slice(0, start) + insertText + code.slice(end)
 }
 
 function orderAndValidatePoints(points: readonly TimelinePoint[]): TimelinePoint[] {

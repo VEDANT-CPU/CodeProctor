@@ -34,12 +34,21 @@ export interface LargePastePayload {
   source?: 'clipboard' | 'unknown'
 }
 
-/** Size of a code edit used to establish coding activity and insertion bursts. */
+/**
+ * One edit operation and its exact patch for timeline reconstruction.
+ *
+ * This `CODE_EDIT` event is the code delta: its `(sessionId, seq)` is the
+ * single timeline identity for the edit. Do not persist a second delta event.
+ */
 export interface CodeEditPayload {
-  /** Number of characters inserted by this edit. */
-  insertedCharacterCount: number
-  /** Number of characters deleted by this edit. */
-  deletedCharacterCount: number
+  /** Zero-based UTF-16 offset, matching browser editor selection APIs. */
+  start: number
+  /** Number of UTF-16 code units removed at `start`. */
+  deleteCount: number
+  /** Optional removed text, used to verify the reconstructed source state. */
+  deletedText?: string
+  /** Text inserted at `start` after the deletion. */
+  insertText: string
 }
 
 /** Result metadata for a curated test suite run. */
