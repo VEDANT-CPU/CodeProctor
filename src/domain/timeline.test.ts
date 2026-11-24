@@ -1,16 +1,16 @@
 import { describe, expect, it } from 'vitest'
 import { reconstructTimeline } from './timeline'
-import type { CodeDelta, CodeSnapshot, TimelinePoint } from './timeline'
+import type { CodeDelta, SnapshotTimelinePoint, TimelinePoint } from './timeline'
 import type { TelemetryEvent } from './telemetry'
 
-function snapshot(seq: number, code: string, timestamp = seq * 1_000): CodeSnapshot {
+function snapshot(seq: number, code: string, timestamp = seq * 1_000): SnapshotTimelinePoint {
   return {
     kind: 'snapshot',
     snapshotId: `snapshot-${seq}`,
     sessionId: 'session-a',
     seq,
     clientTimestamp: timestamp,
-    reason: 'periodic',
+    trigger: 'periodic',
     code,
   }
 }

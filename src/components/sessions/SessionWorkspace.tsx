@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import {
   canAccessSession,
@@ -9,16 +9,42 @@ import {
 } from '../../domain/guards'
 import { runCuratedTestSuite, type CuratedTestSuiteResult } from '../../domain/test-runner'
 import { toSessionContext, type AssessmentSession } from '../../domain/session'
-import type { TestRunPayload } from '../../domain/telemetry'
+import { SNAPSHOT_INTERVAL_MS } from '../../domain/timeline'
+import type { CodeEditPayload, TestRunPayload } from '../../domain/telemetry'
 import { useActorContext } from '../../hooks/useActorContext'
 import { callWorkerAction, getActionErrorMessage } from '../../lib/action-client'
+import type { SessionTelemetryCollector } from '../../lib/session-telemetry'
 import { Badge, Button, buttonVariants, ConfirmModal, Label, Textarea } from '../ui'
 
 interface SessionWorkspaceProps {
-  onTestRunCompleted?: (payload: TestRunPayload) => void
+  collector: SessionTelemetryCollector
+  onTestRunCompleted?: (payload: TestRunPayload, code: string) => void | Promise<void>
 }
 
-export function SessionWorkspace({ onTestRunCompleted }: SessionWorkspaceProps) {
+function codeEdit(previous: string, next: string): CodeEditPayload | null {
+  if (previous === next) return null
+  let start = 0
+  while (start < previous.length && start < next.length && previous[start] === next[start]) {
+    start += 1
+  }
+  let suffixLength = 0
+  while (
+    suffixLength < previous.length - start &&
+    suffixLength < next.length - start &&
+    previous[previous.length - suffixLength - 1] === next[next.length - suffixLength - 1]
+  ) {
+    suffixLength += 1
+  }
+  const end = previous.length - suffixLength
+  return {
+    start,
+    deleteCount: end - start,
+    deletedText: previous.slice(start, end),
+    insertText: next.slice(start, next.length - suffixLength),
+  }
+}
+
+export function SessionWorkspace({ collector, onTestRunCompleted }: SessionWorkspaceProps) {
   const { sessionId } = useParams<{ sessionId: string }>()
   const { actor, isCandidate } = useActorContext()
   const [session, setSession] = useState<AssessmentSession | null>(null)
@@ -31,6 +57,10 @@ export function SessionWorkspace({ onTestRunCompleted }: SessionWorkspaceProps) 
   const [runningTests, setRunningTests] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [confirmSubmit, setConfirmSubmit] = useState(false)
+  const [pendingTelemetryCount, setPendingTelemetryCount] = useState(collector.pendingCount)
+  const codeRef = useRef('')
+  const lastPeriodicSnapshotCode = useRef<string | null>(null)
+  const disconnectedAt = useRef<number | null>(null)
 
   useEffect(() => {
     setLoading(true)
@@ -63,7 +93,10 @@ export function SessionWorkspace({ onTestRunCompleted }: SessionWorkspaceProps) 
 
   useEffect(() => {
     if (!loadedSessionId) return
-    setCode(starterCode ?? '')
+    const initialCode = starterCode ?? ''
+    codeRef.current = initialCode
+    lastPeriodicSnapshotCode.current = initialCode
+    setCode(initialCode)
     setSelectedSuiteId(firstSuiteId)
     setTestRun(null)
   }, [loadedSessionId, starterCode, firstSuiteId])
@@ -96,6 +129,132 @@ export function SessionWorkspace({ onTestRunCompleted }: SessionWorkspaceProps) 
   )
   const selectedSuite = session?.problem.testSuites.find((suite) => suite.id === selectedSuiteId)
 
+  useEffect(() => {
+    collector.setErrorHandler((collectorError) => {
+      setActionError(getActionErrorMessage(collectorError))
+    })
+    collector.setStatusHandler(setPendingTelemetryCount)
+    return () => {
+      collector.setErrorHandler(undefined)
+      collector.setStatusHandler(undefined)
+    }
+  }, [collector])
+
+  useEffect(() => {
+    if (!canEdit || !session) return
+
+    const report = (operation: Promise<unknown>) => {
+      void operation.catch((telemetryError: unknown) => {
+        setActionError(getActionErrorMessage(telemetryError))
+      })
+    }
+
+    const handleOffline = () => {
+      if (disconnectedAt.current !== null) return
+      disconnectedAt.current = Date.now()
+      report(
+        collector
+          .recordTelemetry('CONNECTION_LOST', {
+            bufferedEventCount: collector.pendingTelemetryCount,
+            reason: 'offline',
+          })
+          .then(() => collector.setConnection(false)),
+      )
+    }
+
+    const handleOnline = () => {
+      const disconnectedSince = disconnectedAt.current
+      const flushedEventCount = collector.pendingTelemetryCount
+      report(
+        collector.setConnection(true).then(async () => {
+          if (disconnectedSince === null) return
+          await collector.recordTelemetry('CONNECTION_RECOVERED', {
+            disconnectDurationMs: Math.max(0, Date.now() - disconnectedSince),
+            flushedEventCount,
+          })
+          disconnectedAt.current = null
+        }),
+      )
+    }
+
+    let focused = true
+    const handleFocusLost = (trigger: 'blur' | 'visibilitychange') => {
+      if (document.visibilityState === 'visible' && trigger === 'visibilitychange') return
+      if (!focused) return
+      focused = false
+      report(
+        collector.recordTelemetry('FOCUS_LOST', {
+          visibility: document.visibilityState === 'hidden' ? 'hidden' : 'visible',
+          trigger,
+        }),
+      )
+    }
+
+    const handleFocusRestored = () => {
+      if (focused || document.visibilityState !== 'visible') return
+      focused = true
+      report(collector.recordTelemetry('FOCUS_RESTORED', { visibility: 'visible' }))
+    }
+
+    const handleBlur = () => handleFocusLost('blur')
+    const handleFocus = () => handleFocusRestored()
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') handleFocusLost('visibilitychange')
+      else handleFocusRestored()
+    }
+
+    if (navigator.onLine) {
+      report(collector.setConnection(true, true))
+    } else {
+      handleOffline()
+    }
+    if (document.visibilityState === 'hidden') handleFocusLost('visibilitychange')
+    window.addEventListener('offline', handleOffline)
+    window.addEventListener('online', handleOnline)
+    window.addEventListener('blur', handleBlur)
+    window.addEventListener('focus', handleFocus)
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+
+    return () => {
+      window.removeEventListener('offline', handleOffline)
+      window.removeEventListener('online', handleOnline)
+      window.removeEventListener('blur', handleBlur)
+      window.removeEventListener('focus', handleFocus)
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+      if (collector.connectionState !== false) {
+        report(collector.setConnection(false))
+      }
+    }
+  }, [canEdit, collector, session?.id])
+
+  useEffect(() => {
+    if (!canEdit || !session) return
+    const timer = window.setInterval(() => {
+      const currentCode = codeRef.current
+      if (currentCode === lastPeriodicSnapshotCode.current) return
+      lastPeriodicSnapshotCode.current = currentCode
+      void collector
+        .recordSnapshot({ trigger: 'periodic', code: currentCode })
+        .catch((snapshotError: unknown) => {
+          lastPeriodicSnapshotCode.current = null
+          setActionError(getActionErrorMessage(snapshotError))
+        })
+    }, SNAPSHOT_INTERVAL_MS)
+    return () => window.clearInterval(timer)
+  }, [canEdit, collector, session?.id])
+
+  function updateCode(nextCode: string) {
+    const patch = codeEdit(codeRef.current, nextCode)
+    codeRef.current = nextCode
+    setCode(nextCode)
+    setTestRun(null)
+    if (patch && canEdit) {
+      void collector.recordTelemetry('CODE_EDIT', patch).catch((telemetryError: unknown) => {
+        setActionError(getActionErrorMessage(telemetryError))
+      })
+    }
+  }
+
   async function handleRunSuite() {
     if (!selectedSuite || !canRunTests) return
     setRunningTests(true)
@@ -109,8 +268,14 @@ export function SessionWorkspace({ onTestRunCompleted }: SessionWorkspaceProps) 
       return
     }
     setTestRun(result)
-    setRunningTests(false)
-    onTestRunCompleted?.(result.payload)
+    lastPeriodicSnapshotCode.current = code
+    try {
+      await onTestRunCompleted?.(result.payload, code)
+    } catch (telemetryError) {
+      setActionError(getActionErrorMessage(telemetryError))
+    } finally {
+      setRunningTests(false)
+    }
   }
 
   async function handleSubmitSolution() {
@@ -118,6 +283,15 @@ export function SessionWorkspace({ onTestRunCompleted }: SessionWorkspaceProps) 
     setSubmitting(true)
     setActionError(null)
     try {
+      await collector.recordSnapshot({ trigger: 'final_submit', code })
+      await collector.flush()
+      if (collector.pendingCount > 0) {
+        throw new Error('Reconnect to send pending session telemetry before submitting.')
+      }
+      await collector.setConnection(false)
+      if (collector.pendingCount > 0) {
+        throw new Error('Reconnect to update session connection state before submitting.')
+      }
       const submittedSession = await callWorkerAction<AssessmentSession>(
         'submit_assessment_session',
         { sessionId: session.id },
@@ -126,6 +300,11 @@ export function SessionWorkspace({ onTestRunCompleted }: SessionWorkspaceProps) 
       setConfirmSubmit(false)
     } catch (submitError) {
       setActionError(getActionErrorMessage(submitError))
+      if (navigator.onLine && session.status === 'active') {
+        void collector.setConnection(true).catch((connectionError: unknown) => {
+          setActionError(getActionErrorMessage(connectionError))
+        })
+      }
     } finally {
       setSubmitting(false)
     }
@@ -177,6 +356,14 @@ export function SessionWorkspace({ onTestRunCompleted }: SessionWorkspaceProps) 
                 <p className="mt-2 text-sm text-muted-foreground">
                   Tests run in a time-limited browser Worker. This client-side runner is not a security boundary or server-side verification.
                 </p>
+                <p className="mt-2 text-xs text-muted-foreground">
+                  Monitoring is limited to browser tab focus, paste bursts, test runs, and connection status. There is no OS lockdown, webcam monitoring, or screen recording.
+                </p>
+                {pendingTelemetryCount > 0 && (
+                  <p role="status" className="mt-2 text-sm text-muted-foreground">
+                    {pendingTelemetryCount} telemetry item{pendingTelemetryCount === 1 ? '' : 's'} queued and will retry when the connection is available.
+                  </p>
+                )}
                 {!canAccess && actor && (
                   <p role="alert" className="mt-3 text-sm text-destructive">
                     Your current actor is not authorized to use this session.
@@ -203,8 +390,7 @@ export function SessionWorkspace({ onTestRunCompleted }: SessionWorkspaceProps) 
                       size="sm"
                       disabled={!canEdit || code === session.problem.starterCode}
                       onClick={() => {
-                        setCode(session.problem.starterCode)
-                        setTestRun(null)
+                        updateCode(session.problem.starterCode)
                       }}
                     >
                       Reset to Starter
@@ -218,9 +404,21 @@ export function SessionWorkspace({ onTestRunCompleted }: SessionWorkspaceProps) 
                     spellCheck={false}
                     readOnly={!canEdit}
                     value={code}
-                    onChange={(event) => {
-                      setCode(event.target.value)
-                      setTestRun(null)
+                    onChange={(event) => updateCode(event.target.value)}
+                    onPaste={(event) => {
+                      if (!canEdit) return
+                      const pastedText = event.clipboardData.getData('text/plain')
+                      const characterCount = pastedText.length
+                      if (characterCount <= 120) return
+                      void collector
+                        .recordTelemetry('LARGE_PASTE', {
+                          characterCount,
+                          lineCount: pastedText.split(/\r\n|\r|\n/).length,
+                          source: 'clipboard',
+                        })
+                        .catch((telemetryError: unknown) => {
+                          setActionError(getActionErrorMessage(telemetryError))
+                        })
                     }}
                   />
                 </div>

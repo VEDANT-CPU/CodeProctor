@@ -1,30 +1,15 @@
 import type { IntegrityIncident } from './incidents'
-import type { TelemetryEvent } from './telemetry'
+import type { CodeSnapshot, TelemetryEvent } from './telemetry'
 
-/** Snapshot trigger reasons required by the assessment timeline. */
-export type SnapshotReason = 'periodic' | 'test_run' | 'final_submit'
+export type { CodeSnapshot, SnapshotTrigger } from './telemetry'
 
 /** Recommended maximum interval between full code snapshots, in milliseconds. */
 export const SNAPSHOT_INTERVAL_MS = 30_000
 
-/** Full code checkpoint stored at a sequence-ordered timeline position. */
-export interface CodeSnapshot {
+/** Snapshot tagged as a timeline point for deterministic reconstruction. */
+export interface SnapshotTimelinePoint extends CodeSnapshot {
   /** Discriminator for a full code checkpoint. */
   kind: 'snapshot'
-  /** Stable identifier for this snapshot. */
-  snapshotId: string
-  /** Assessment session that owns this checkpoint. */
-  sessionId: string
-  /** Session-scoped sequence number, starting at 1. */
-  seq: number
-  /** Client-observed checkpoint time in Unix epoch milliseconds. */
-  clientTimestamp: number
-  /** Server receive time in Unix epoch milliseconds, when ingested. */
-  serverReceivedAt?: number
-  /** Why this full snapshot was captured. */
-  reason: SnapshotReason
-  /** Complete source code at this checkpoint. */
-  code: string
 }
 
 /** Telemetry timeline point, retaining its typed event and shared sequence. */
@@ -40,7 +25,7 @@ export type TelemetryTimelinePoint = TelemetryEvent & {
 export type CodeDelta = Extract<TelemetryEvent, { type: 'CODE_EDIT' }>
 
 /** Full snapshots and telemetry events in one sequence-ordered session timeline. */
-export type TimelinePoint = CodeSnapshot | TelemetryTimelinePoint
+export type TimelinePoint = SnapshotTimelinePoint | TelemetryTimelinePoint
 
 /** Cursor for deterministic scrubbing by sequence number or client time. */
 export type TimelineCursor =

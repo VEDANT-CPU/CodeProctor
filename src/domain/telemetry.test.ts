@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import {
+  deduplicateCodeSnapshots,
   deduplicateTelemetryEvents,
   isValidSequenceNumber,
+  orderCodeSnapshots,
   orderTelemetryEvents,
 } from './telemetry'
-import type { TelemetryEvent } from './telemetry'
+import type { CodeSnapshot, TelemetryEvent } from './telemetry'
 
 function focusEvent(
   sessionId: string,
@@ -44,6 +46,17 @@ function focusEvent(
   }
 }
 
+function codeSnapshot(sessionId: string, seq: number): CodeSnapshot {
+  return {
+    snapshotId: `${sessionId}:snap:${seq}`,
+    sessionId,
+    seq,
+    clientTimestamp: seq * 100,
+    trigger: 'periodic',
+    code: `code-${seq}`,
+  }
+}
+
 describe('telemetry sequence helpers', () => {
   it('accepts positive safe integer sequences starting at one', () => {
     expect(isValidSequenceNumber(1)).toBe(true)
@@ -75,6 +88,33 @@ describe('telemetry sequence helpers', () => {
     ]
 
     expect(orderTelemetryEvents(events).map(({ sessionId, seq }) => [sessionId, seq])).toEqual([
+      ['session-a', 1],
+      ['session-a', 3],
+      ['session-b', 1],
+      ['session-b', 2],
+    ])
+  })
+
+  it('deduplicates snapshots by session and sequence, keeping the first occurrence', () => {
+    const first = codeSnapshot('session-a', 1)
+    const retry = { ...first, snapshotId: 'retry', code: 'different' }
+    const otherSession = codeSnapshot('session-b', 1)
+
+    expect(deduplicateCodeSnapshots([first, retry, otherSession])).toEqual([
+      first,
+      otherSession,
+    ])
+  })
+
+  it('orders snapshots by session and sequence after deduplication', () => {
+    const snapshots = [
+      codeSnapshot('session-b', 2),
+      codeSnapshot('session-a', 3),
+      codeSnapshot('session-a', 1),
+      codeSnapshot('session-b', 1),
+    ]
+
+    expect(orderCodeSnapshots(snapshots).map(({ sessionId, seq }) => [sessionId, seq])).toEqual([
       ['session-a', 1],
       ['session-a', 3],
       ['session-b', 1],

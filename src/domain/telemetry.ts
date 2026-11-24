@@ -63,6 +63,32 @@ export interface TestRunPayload {
   durationMs: number
 }
 
+/**
+ * Checkpoint reason that produced a full candidate code snapshot.
+ * Periodic snapshots are typically captured every 30 seconds while coding.
+ */
+export type SnapshotTrigger = 'periodic' | 'test_run' | 'final_submit'
+
+/** Full candidate source code captured at a deterministic timeline point. */
+export interface CodeSnapshot {
+  /** Unique identifier for this snapshot, such as `${sessionId}:snap:${seq}`. */
+  snapshotId: string
+  /** Assessment session containing this snapshot. */
+  sessionId: string
+  /** Session-scoped sequence number, starting at 1. */
+  seq: number
+  /** Client-observed capture time in Unix epoch milliseconds. */
+  clientTimestamp: number
+  /** Server receive time in Unix epoch milliseconds, when ingested. */
+  serverReceivedAt?: number
+  /** Event that triggered the full snapshot. */
+  trigger: SnapshotTrigger
+  /** Complete candidate source code at capture time. */
+  code: string
+  /** Curated suite that triggered this snapshot, when applicable. */
+  suiteId?: string
+}
+
 /** Context recorded when the candidate connection is interrupted. */
 export interface ConnectionLostPayload {
   /** Number of locally buffered events awaiting upload. */
@@ -169,6 +195,42 @@ export function orderTelemetryEvents(
   events: readonly TelemetryEvent[],
 ): TelemetryEvent[] {
   return deduplicateTelemetryEvents(events).sort((left, right) => {
+    if (left.sessionId < right.sessionId) return -1
+    if (left.sessionId > right.sessionId) return 1
+    return left.seq - right.seq
+  })
+}
+
+/**
+ * Removes repeated snapshots with the same `(sessionId, seq)` key.
+ * The first snapshot wins, matching telemetry retry semantics.
+ */
+export function deduplicateCodeSnapshots(
+  snapshots: readonly CodeSnapshot[],
+): CodeSnapshot[] {
+  const seenBySession = new Map<string, Set<number>>()
+  const uniqueSnapshots: CodeSnapshot[] = []
+
+  for (const snapshot of snapshots) {
+    let seenSequences = seenBySession.get(snapshot.sessionId)
+    if (!seenSequences) {
+      seenSequences = new Set<number>()
+      seenBySession.set(snapshot.sessionId, seenSequences)
+    }
+
+    if (seenSequences.has(snapshot.seq)) continue
+    seenSequences.add(snapshot.seq)
+    uniqueSnapshots.push(snapshot)
+  }
+
+  return uniqueSnapshots
+}
+
+/** Deduplicates and orders snapshots by session ID, then ascending sequence. */
+export function orderCodeSnapshots(
+  snapshots: readonly CodeSnapshot[],
+): CodeSnapshot[] {
+  return deduplicateCodeSnapshots(snapshots).sort((left, right) => {
     if (left.sessionId < right.sessionId) return -1
     if (left.sessionId > right.sessionId) return 1
     return left.seq - right.seq

@@ -3,11 +3,15 @@ import { Link } from 'react-router-dom'
 import { useQuery } from 'deepspace'
 import type { RecordData } from 'deepspace'
 import type { AssessmentSession } from '../../domain/session'
+import type { CodeSnapshot, TelemetryEvent } from '../../domain/telemetry'
 import { useActorContext } from '../../hooks/useActorContext'
 import { callWorkerAction, getActionErrorMessage } from '../../lib/action-client'
 import { Badge, Button, buttonVariants } from '../ui'
 import { CandidateSessionEntry, SessionStatus } from './CandidateSessionEntry'
 import { CreateSessionForm } from './CreateSessionForm'
+
+type PersistedTelemetryEvent = TelemetryEvent & { candidateId: string }
+type PersistedCodeSnapshot = CodeSnapshot & { candidateId: string }
 
 function timestamp(value: number | null): string {
   return value === null ? 'Not set' : new Date(value).toLocaleString()
@@ -18,6 +22,24 @@ function ProctorSessionList() {
     orderBy: 'createdAt',
     orderDir: 'desc',
     limit: 50,
+  })
+  const {
+    records: telemetryRecords,
+    status: telemetryStatus,
+    error: telemetryError,
+  } = useQuery<PersistedTelemetryEvent>('telemetry-events', {
+    orderBy: 'serverReceivedAt',
+    orderDir: 'desc',
+    limit: 200,
+  })
+  const {
+    records: snapshotRecords,
+    status: snapshotStatus,
+    error: snapshotError,
+  } = useQuery<PersistedCodeSnapshot>('code-snapshots', {
+    orderBy: 'serverReceivedAt',
+    orderDir: 'desc',
+    limit: 200,
   })
   const [createdSessions, setCreatedSessions] = useState<AssessmentSession[]>([])
   const [startingSessionId, setStartingSessionId] = useState<string | null>(null)
@@ -76,6 +98,16 @@ function ProctorSessionList() {
             {actionError}
           </p>
         )}
+        {telemetryStatus === 'error' && (
+          <p role="alert" className="text-sm text-destructive">
+            {telemetryError ?? 'Could not load recent telemetry.'}
+          </p>
+        )}
+        {snapshotStatus === 'error' && (
+          <p role="alert" className="text-sm text-destructive">
+            {snapshotError ?? 'Could not load recent code snapshots.'}
+          </p>
+        )}
         {status === 'loading' ? (
           <p role="status" className="text-sm text-muted-foreground">Loading sessions…</p>
         ) : status === 'error' ? (
@@ -86,41 +118,75 @@ function ProctorSessionList() {
           </p>
         ) : (
           <div className="space-y-3">
-            {listedSessions.map((session) => (
-              <article key={session.id} className="space-y-4 rounded-xl border border-border bg-card p-5">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <h3 className="font-semibold">{session.problem.title}</h3>
-                    <p className="mt-1 break-all text-xs text-muted-foreground">
-                      {session.id} · candidate {session.candidateId}
-                    </p>
+            {listedSessions.map((session) => {
+              const recentTelemetry = telemetryRecords
+                .map((record: RecordData<PersistedTelemetryEvent>) => record.data)
+                .filter((event) => event.sessionId === session.id)
+              const recentSnapshots = snapshotRecords
+                .map((record: RecordData<PersistedCodeSnapshot>) => record.data)
+                .filter((snapshot) => snapshot.sessionId === session.id)
+              const latestEvent = recentTelemetry.reduce<PersistedTelemetryEvent | null>(
+                (latest, event) => !latest || event.seq > latest.seq ? event : latest,
+                null,
+              )
+              const latestSnapshot = recentSnapshots.reduce<PersistedCodeSnapshot | null>(
+                (latest, snapshot) => !latest || snapshot.seq > latest.seq ? snapshot : latest,
+                null,
+              )
+
+              return (
+                <article key={session.id} className="space-y-4 rounded-xl border border-border bg-card p-5">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <h3 className="font-semibold">{session.problem.title}</h3>
+                      <p className="mt-1 break-all text-xs text-muted-foreground">
+                        {session.id} · candidate {session.candidateId}
+                      </p>
+                    </div>
+                    <SessionStatus status={session.status} />
                   </div>
-                  <SessionStatus status={session.status} />
-                </div>
-                <dl className="grid gap-3 text-sm sm:grid-cols-3">
-                  <div><dt className="text-muted-foreground">Created</dt><dd>{timestamp(session.createdAt)}</dd></div>
-                  <div><dt className="text-muted-foreground">Started</dt><dd>{timestamp(session.startedAt)}</dd></div>
-                  <div><dt className="text-muted-foreground">Deadline</dt><dd>{timestamp(session.expiresAt)}</dd></div>
-                </dl>
-                <div className="flex flex-wrap gap-2">
-                  {session.status === 'pending' && (
-                    <Button
-                      onClick={() => void startSession(session.id)}
-                      loading={startingSessionId === session.id}
-                      disabled={startingSessionId !== null && startingSessionId !== session.id}
-                    >
-                      Start session
-                    </Button>
+                  <dl className="grid gap-3 text-sm sm:grid-cols-3">
+                    <div><dt className="text-muted-foreground">Created</dt><dd>{timestamp(session.createdAt)}</dd></div>
+                    <div><dt className="text-muted-foreground">Started</dt><dd>{timestamp(session.startedAt)}</dd></div>
+                    <div><dt className="text-muted-foreground">Deadline</dt><dd>{timestamp(session.expiresAt)}</dd></div>
+                    <div><dt className="text-muted-foreground">Connection</dt><dd>{session.isConnected ? 'Connected' : 'Disconnected'}</dd></div>
+                    <div><dt className="text-muted-foreground">Reconnects</dt><dd>{session.reconnectCount}</dd></div>
+                    <div><dt className="text-muted-foreground">Last seen</dt><dd>{timestamp(session.lastSeenAt)}</dd></div>
+                  </dl>
+                  {(session.status === 'active' || recentTelemetry.length > 0 || recentSnapshots.length > 0) && (
+                    <div className="rounded-md bg-muted/50 p-3 text-sm">
+                      <p className="font-medium">Live activity</p>
+                      <p className="mt-1 text-muted-foreground">
+                        {recentTelemetry.length} recent telemetry events · {recentSnapshots.length} recent snapshots (from latest 200 per collection)
+                      </p>
+                      <p className="mt-1 text-muted-foreground">
+                        Latest event: {latestEvent ? `${latestEvent.type} · seq ${latestEvent.seq}` : 'None'}
+                      </p>
+                      <p className="text-muted-foreground">
+                        Latest snapshot: {latestSnapshot ? `${latestSnapshot.trigger} · seq ${latestSnapshot.seq}` : 'None'}
+                      </p>
+                    </div>
                   )}
-                  <Link
-                    className={buttonVariants({ variant: 'outline' })}
-                    to={`/sessions/${encodeURIComponent(session.id)}`}
-                  >
-                    Open workspace
-                  </Link>
-                </div>
-              </article>
-            ))}
+                  <div className="flex flex-wrap gap-2">
+                    {session.status === 'pending' && (
+                      <Button
+                        onClick={() => void startSession(session.id)}
+                        loading={startingSessionId === session.id}
+                        disabled={startingSessionId !== null && startingSessionId !== session.id}
+                      >
+                        Start session
+                      </Button>
+                    )}
+                    <Link
+                      className={buttonVariants({ variant: 'outline' })}
+                      to={`/sessions/${encodeURIComponent(session.id)}`}
+                    >
+                      Open workspace
+                    </Link>
+                  </div>
+                </article>
+              )
+            })}
           </div>
         )}
       </section>
