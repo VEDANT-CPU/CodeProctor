@@ -30,7 +30,7 @@ export type CuratedTestCase = CuratedTestCaseBase &
     | {
         /** Identifies a test case expressed as an assertion descriptor. */
         kind: 'assertion'
-        /** Human-readable behavior the curated test suite should assert. */
+        /** JavaScript expression evaluated after the candidate code is loaded. */
         assertion: string
       }
   )

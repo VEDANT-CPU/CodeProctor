@@ -28,7 +28,7 @@ const prompt: ProblemPrompt = {
           id: 'returns-number',
           name: 'Returns a number',
           kind: 'assertion',
-          assertion: 'The result is a number.',
+          assertion: 'typeof solve(2) === "number"',
         } satisfies CuratedTestCase,
       ],
     },

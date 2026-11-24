@@ -65,7 +65,16 @@ export function registerActionRoutes(app: Hono<AppContext>, resolveAuth: Resolve
     const params = await c.req.json<Record<string, unknown>>()
     const tools = createActionTools(c.env, auth.userId, callerJwt)
     const result = await action({ userId: auth.userId, params, tools, env: c.env, callerJwt })
-    return c.json(result as unknown as Record<string, unknown>)
+    const status = result.success
+      ? 200
+      : result.code === 'unauthorized'
+        ? 401
+        : result.code === 'forbidden'
+          ? 403
+          : result.code === 'assignment_lookup_failed'
+            ? 503
+            : 200
+    return c.json(result as unknown as Record<string, unknown>, status)
   })
 }
 

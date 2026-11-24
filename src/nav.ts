@@ -6,7 +6,7 @@
  * appears in the navigation bar.
  */
 
-import type { Role } from './constants'
+import type { Role } from './domain/types'
 
 export interface NavItem {
   path: string
@@ -17,6 +17,7 @@ export interface NavItem {
 
 export const nav: NavItem[] = [
   { path: '/home', label: 'Home' },
+  { path: '/sessions', label: 'Sessions', roles: ['candidate', 'proctor'] },
   { path: '/settings', label: 'Settings' },
   // The /api-status debug page still exists — add
   // `{ path: '/api-status', label: 'API Status', devOnly: true }` to surface it.

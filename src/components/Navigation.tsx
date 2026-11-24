@@ -13,7 +13,8 @@ import { Link, useLocation } from 'react-router-dom'
 import { AuthOverlay, useAuthProfileReady, signOut } from 'deepspace'
 import { ChevronDown, LogOut, Menu, X } from 'lucide-react'
 import { APP_NAME } from '../constants'
-import type { Role } from '../constants'
+import type { Role } from '../domain/types'
+import { useActorContext } from '../hooks/useActorContext'
 import { nav } from '../nav'
 import { cn } from '../lib/utils'
 import {
@@ -30,12 +31,12 @@ import {
 
 export default function Navigation() {
   const { isLoaded, isSignedIn, user, userLoading } = useAuthProfileReady({ requireUser: true })
+  const { actor, domainRole } = useActorContext()
   const location = useLocation()
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const [showAuthModal, setShowAuthModal] = useState(false)
 
   const profileReady = !isSignedIn || (!userLoading && !!user)
-  const userRole = (user?.role ?? 'anonymous') as Role | 'anonymous'
 
   // Close the mobile menu when navigating
   useEffect(() => {
@@ -46,8 +47,8 @@ export default function Navigation() {
     if (item.devOnly && !import.meta.env.DEV) return false
     if (!item.roles) return true
     if (!profileReady) return false
-    if (userRole === 'admin') return true
-    return item.roles.includes(userRole as Role)
+    if (!actor || !domainRole) return false
+    return item.roles.includes(domainRole)
   })
 
   const navLink = (item: (typeof nav)[number]) => {
