@@ -12,6 +12,14 @@ export type ReviewDisposition =
   /** Reviewer marked the session or signal for follow-up. */
   | 'flagged'
 
+/** Ordered list of valid review dispositions. */
+export const reviewDispositions: readonly ReviewDisposition[] = [
+  'unreviewed',
+  'clear',
+  'needs_review',
+  'flagged',
+]
+
 /**
  * Stable session-scoped location in a timeline. `(sessionId, seq)` identifies
  * the timeline record; timestamp is retained for audit and display.

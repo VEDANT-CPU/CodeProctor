@@ -1,12 +1,14 @@
 import type { ActionContext, ActionHandler, ActionResult, ActionTools } from 'deepspace/worker'
 import { canCandidateMutateSession } from '../domain/guards.js'
+import type { ProctorAnnotation, ReviewDisposition, TimelineAnchor } from '../domain/review.js'
+import { reviewDispositions } from '../domain/review.js'
 import type {
   AssessmentSession,
   CuratedTestCase,
   ProblemPrompt,
   TestSuiteDescriptor,
 } from '../domain/session.js'
-import type { ActorContext } from '../domain/types.js'
+import type { ActorContext, SessionAction } from '../domain/types.js'
 import { toSessionContext } from '../domain/session.js'
 import type { SessionStatus } from '../domain/types.js'
 import {
@@ -32,6 +34,7 @@ import type { Env } from '../../worker.js'
 const COLLECTION = 'assessment-sessions'
 const TELEMETRY_COLLECTION = 'telemetry-events'
 const SNAPSHOT_COLLECTION = 'code-snapshots'
+const ANNOTATIONS_COLLECTION = 'proctor-annotations'
 const MAX_CLIENT_CLOCK_SKEW_MS = 5 * 60_000
 
 type StoredAssessmentSession = AssessmentSession & Record<string, unknown>
@@ -196,7 +199,14 @@ function isStoredAssessmentSession(value: unknown): value is StoredAssessmentSes
     isNullableTimestamp(value.submittedAt) &&
     typeof value.expiresAt === 'number' &&
     Number.isFinite(value.expiresAt) &&
-    isNullableTimestamp(value.lastSeenAt)
+    isNullableTimestamp(value.lastSeenAt) &&
+    (value.disposition === undefined ||
+      (typeof value.disposition === 'string' &&
+        reviewDispositions.includes(value.disposition as ReviewDisposition))) &&
+    (value.dispositionedAt === undefined || isNullableTimestamp(value.dispositionedAt)) &&
+    (value.dispositionedByProctorId === undefined ||
+      value.dispositionedByProctorId === null ||
+      typeof value.dispositionedByProctorId === 'string')
   )
 }
 
@@ -240,7 +250,14 @@ async function loadSession(
       result: failure('Stored assessment session is invalid', 'invalid_session_record'),
     }
   }
-  return { success: true, session: record.data }
+  const data = record.data
+  const session: AssessmentSession = {
+    ...data,
+    disposition: data.disposition ?? 'unreviewed',
+    dispositionedAt: data.dispositionedAt ?? null,
+    dispositionedByProctorId: data.dispositionedByProctorId ?? null,
+  }
+  return { success: true, session }
 }
 
 async function findExistingSequence(
@@ -329,6 +346,9 @@ export const createAssessmentSession: ActionHandler<Env> = async (context) => {
     submittedAt: null,
     expiresAt,
     lastSeenAt: null,
+    disposition: 'unreviewed',
+    dispositionedAt: null,
+    dispositionedByProctorId: null,
   }
 
   const created = await context.tools.create(COLLECTION, { ...session }, session.id)
@@ -872,6 +892,181 @@ export const updateSessionConnection: ActionHandler<Env> = async (context) => {
   return { success: true, data: updatedSession }
 }
 
+function isTimelineAnchor(value: unknown, expectedSessionId: string): value is TimelineAnchor {
+  return (
+    isObject(value) &&
+    value.sessionId === expectedSessionId &&
+    typeof value.seq === 'number' &&
+    isValidSequenceNumber(value.seq) &&
+    typeof value.timestamp === 'number' &&
+    Number.isFinite(value.timestamp) &&
+    value.timestamp >= 0
+  )
+}
+
+function isStoredProctorAnnotation(
+  value: unknown,
+  expectedSessionId: string,
+): value is ProctorAnnotation {
+  return (
+    isObject(value) &&
+    typeof value.id === 'string' &&
+    value.id.trim().length > 0 &&
+    value.sessionId === expectedSessionId &&
+    typeof value.proctorId === 'string' &&
+    value.proctorId.trim().length > 0 &&
+    typeof value.notes === 'string' &&
+    typeof value.disposition === 'string' &&
+    reviewDispositions.includes(value.disposition as ReviewDisposition) &&
+    (value.incidentId === undefined ||
+      (typeof value.incidentId === 'string' && value.incidentId.trim().length > 0)) &&
+    (value.anchor === undefined || isTimelineAnchor(value.anchor, expectedSessionId)) &&
+    typeof value.createdAt === 'number' &&
+    Number.isFinite(value.createdAt) &&
+    typeof value.updatedAt === 'number' &&
+    Number.isFinite(value.updatedAt)
+  )
+}
+
+export const addProctorAnnotation: ActionHandler<Env> = async (context) => {
+  const sessionId = context.params.sessionId
+  const notes = context.params.notes
+  const disposition = context.params.disposition
+  const incidentId = context.params.incidentId
+  const anchor = context.params.anchor
+
+  if (typeof sessionId !== 'string' || !sessionId.trim()) return missingParam('sessionId')
+  if (typeof notes !== 'string' || !notes.trim()) return missingParam('notes')
+  if (
+    typeof disposition !== 'string' ||
+    !reviewDispositions.includes(disposition as ReviewDisposition)
+  ) {
+    return missingParam('disposition')
+  }
+  if (incidentId !== undefined && (typeof incidentId !== 'string' || !incidentId.trim())) {
+    return missingParam('incidentId')
+  }
+  if (anchor !== undefined && !isTimelineAnchor(anchor, sessionId)) {
+    return missingParam('anchor')
+  }
+
+  const actorResult = await resolveActor(context)
+  if (isActionResult(actorResult)) return actorResult
+
+  const loaded = await loadSession(context.tools, sessionId)
+  if (!loaded.success) return loaded.result
+  const sessionContext = toSessionContext(loaded.session)
+
+  const requiredAction: SessionAction =
+    disposition === 'flagged' ? 'create_integrity_flag' : 'add_session_note'
+
+  if (
+    !authorizeActorSession(actorResult.actor, sessionContext) ||
+    !authorizeActorAction(actorResult.actor, requiredAction, sessionContext)
+  ) {
+    return failure('Forbidden', 'forbidden')
+  }
+
+  const id = crypto.randomUUID()
+  const now = Date.now()
+  const annotation: ProctorAnnotation = {
+    id,
+    sessionId,
+    proctorId: actorResult.actor.userId,
+    notes: notes.trim(),
+    disposition: disposition as ReviewDisposition,
+    ...(incidentId ? { incidentId: incidentId.trim() } : {}),
+    ...(anchor ? { anchor } : {}),
+    createdAt: now,
+    updatedAt: now,
+  }
+
+  const created = await context.tools.create(ANNOTATIONS_COLLECTION, { ...annotation }, id)
+  if (!created.success) return created
+  return { success: true, data: annotation }
+}
+
+export const getSessionAnnotations: ActionHandler<Env> = async (context) => {
+  const sessionId = context.params.sessionId
+  if (typeof sessionId !== 'string' || !sessionId.trim()) return missingParam('sessionId')
+
+  const actorResult = await resolveActor(context)
+  if (isActionResult(actorResult)) return actorResult
+
+  const loaded = await loadSession(context.tools, sessionId)
+  if (!loaded.success) return loaded.result
+  const sessionContext = toSessionContext(loaded.session)
+
+  if (
+    !authorizeActorSession(actorResult.actor, sessionContext) ||
+    !authorizeActorAction(actorResult.actor, 'view_review_notes', sessionContext)
+  ) {
+    return failure('Forbidden', 'forbidden')
+  }
+
+  const queryResult = await context.tools.query<Record<string, unknown>>(ANNOTATIONS_COLLECTION, {
+    where: { sessionId },
+    orderBy: 'createdAt',
+    orderDir: 'asc',
+  })
+  if (!queryResult.success) return queryResult
+
+  const annotations: ProctorAnnotation[] = []
+  for (const record of queryResult.data.records) {
+    if (!isStoredProctorAnnotation(record.data, sessionId)) {
+      return failure('Stored review annotation record is invalid', 'invalid_annotation_record')
+    }
+    annotations.push(record.data)
+  }
+  annotations.sort((a, b) => a.createdAt - b.createdAt)
+
+  return { success: true, data: annotations }
+}
+
+export const setSessionDisposition: ActionHandler<Env> = async (context) => {
+  const sessionId = context.params.sessionId
+  const disposition = context.params.disposition
+
+  if (typeof sessionId !== 'string' || !sessionId.trim()) return missingParam('sessionId')
+  if (
+    typeof disposition !== 'string' ||
+    !reviewDispositions.includes(disposition as ReviewDisposition)
+  ) {
+    return missingParam('disposition')
+  }
+
+  const actorResult = await resolveActor(context)
+  if (isActionResult(actorResult)) return actorResult
+
+  const loaded = await loadSession(context.tools, sessionId)
+  if (!loaded.success) return loaded.result
+  const sessionContext = toSessionContext(loaded.session)
+
+  if (
+    !authorizeActorSession(actorResult.actor, sessionContext) ||
+    !authorizeActorAction(actorResult.actor, 'set_final_disposition', sessionContext)
+  ) {
+    return failure('Forbidden', 'forbidden')
+  }
+
+  const now = Date.now()
+  const updatedSession: AssessmentSession = {
+    ...loaded.session,
+    disposition: disposition as ReviewDisposition,
+    dispositionedAt: now,
+    dispositionedByProctorId: actorResult.actor.userId,
+    lastSeenAt: loaded.session.lastSeenAt,
+  }
+
+  const updated = await context.tools.update(COLLECTION, sessionId, {
+    disposition: updatedSession.disposition,
+    dispositionedAt: updatedSession.dispositionedAt,
+    dispositionedByProctorId: updatedSession.dispositionedByProctorId,
+  })
+  if (!updated.success) return updated
+  return { success: true, data: updatedSession }
+}
+
 export const assessmentSessionActions: Record<string, ActionHandler<Env>> = {
   create_assessment_session: createAssessmentSession,
   get_assessment_session: getAssessmentSession,
@@ -883,4 +1078,7 @@ export const assessmentSessionActions: Record<string, ActionHandler<Env>> = {
   get_session_timeline_data: getSessionTimelineData,
   get_session_timeline_sequence: getSessionTimelineSequence,
   update_session_connection: updateSessionConnection,
+  add_proctor_annotation: addProctorAnnotation,
+  get_session_annotations: getSessionAnnotations,
+  set_session_disposition: setSessionDisposition,
 }

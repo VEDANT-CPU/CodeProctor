@@ -1,3 +1,4 @@
+import type { ReviewDisposition } from './review.js'
 import type { SessionContext } from './types'
 
 /** Lifecycle states for one candidate's assessment session. */
@@ -94,6 +95,12 @@ export interface AssessmentSession {
   expiresAt: number
   /** Most recent server-observed candidate activity, or null if none. */
   lastSeenAt: number | null
+  /** Review disposition for this session. Defaults to 'unreviewed'. */
+  disposition?: ReviewDisposition
+  /** Time disposition was set or updated, or null if unreviewed. */
+  dispositionedAt?: number | null
+  /** Proctor who set or updated the disposition, or null if unreviewed. */
+  dispositionedByProctorId?: string | null
 }
 
 /**

@@ -21,6 +21,15 @@ export const assessmentSessionsSchema: CollectionSchema = {
     { name: 'submittedAt', storage: 'number', interpretation: 'plain', required: false, default: null },
     { name: 'expiresAt', storage: 'number', interpretation: 'plain', required: true },
     { name: 'lastSeenAt', storage: 'number', interpretation: 'plain', required: false, default: null },
+    {
+      name: 'disposition',
+      storage: 'text',
+      interpretation: { kind: 'select', options: ['unreviewed', 'clear', 'needs_review', 'flagged'] },
+      required: false,
+      default: 'unreviewed',
+    },
+    { name: 'dispositionedAt', storage: 'number', interpretation: 'plain', required: false, default: null },
+    { name: 'dispositionedByProctorId', storage: 'text', interpretation: 'plain', required: false, default: null },
   ],
   permissions: {
     admin: { read: true, create: true, update: true, delete: true },

@@ -13,6 +13,7 @@ import { settingsSchema } from './schemas/admin-schema'
 import { assessmentSessionsSchema } from './schemas/assessment-sessions-schema'
 import { telemetryEventsSchema } from './schemas/telemetry-events-schema'
 import { codeSnapshotsSchema } from './schemas/code-snapshots-schema'
+import { proctorAnnotationsSchema } from './schemas/proctor-annotations-schema'
 
 export const schemas: CollectionSchema[] = [
   usersSchema,
@@ -20,4 +21,5 @@ export const schemas: CollectionSchema[] = [
   assessmentSessionsSchema,
   telemetryEventsSchema,
   codeSnapshotsSchema,
+  proctorAnnotationsSchema,
 ]
