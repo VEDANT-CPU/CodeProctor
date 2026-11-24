@@ -3,7 +3,7 @@ import type { AssessmentSession } from '../../domain/session'
 import { aggregateIntegrityIncidents } from '../../domain/incidents'
 import type { IntegrityIncident } from '../../domain/incidents'
 import { projectTimelinePoints, reconstructTimeline } from '../../domain/timeline'
-import type { ReconstructedState, TimelinePoint } from '../../domain/timeline'
+import type { ReconstructedState, TimelineCursor, TimelinePoint } from '../../domain/timeline'
 import type { CodeSnapshot, TelemetryEvent } from '../../domain/telemetry'
 import { callWorkerAction, getActionErrorMessage } from '../../lib/action-client'
 import { Badge, Button, Textarea } from '../ui'
@@ -30,37 +30,156 @@ interface SessionTimelineInspectorProps {
   onClose: () => void
 }
 
-function formatTimestamp(value: number): string {
+/** Scrubbing cursor mode: monotonic sequence or client-observed timestamp. */
+export type CursorMode = 'seq' | 'timestamp'
+
+/** State representation of the active inspector cursor. */
+export interface InspectorCursorState {
+  mode: CursorMode
+  seq: number
+  timestamp: number
+}
+
+/** Boundary limits for scrubbing ranges in sequence and timestamp dimensions. */
+export interface TimelineBounds {
+  minSeq: number
+  maxSeq: number
+  minTimestamp: number
+  maxTimestamp: number
+}
+
+/** Explanation note displayed during timestamp scrubbing. */
+export const TIMESTAMP_SCRUBBING_NOTE =
+  'Timestamp scrubbing filters timeline events and snapshots whose clientTimestamp is at or before the cursor, while code state and active flags are reconstructed in monotonic sequence order. If events arrived with divergent client clocks or out-of-order flushes, a non-prefix set of sequence points may be included.'
+
+/** Explanation note displayed during sequence scrubbing. */
+export const SEQUENCE_SCRUBBING_NOTE =
+  'Sequence is shared by telemetry events and code snapshots. Missing sequence values are skipped by the history.'
+
+export function formatTimestamp(value: number): string {
   return new Date(value).toLocaleString()
 }
 
-function formatMetricName(value: string): string {
+export function formatMetricName(value: string): string {
   return value.replace(/[A-Z]/g, (letter) => ` ${letter.toLowerCase()}`)
 }
 
-function pointLabel(point: TimelinePoint): string {
+export function pointLabel(point: TimelinePoint): string {
   return point.kind === 'snapshot'
     ? `${point.trigger} snapshot`
     : point.type
 }
 
-function incidentMetrics(incident: IntegrityIncident): readonly [string, number][] {
+export function incidentMetrics(incident: IntegrityIncident): readonly [string, number][] {
   return Object.entries(incident.metrics)
 }
 
-function reconstruct(
+/** Computes timeline sequence and timestamp boundary values across all points. */
+export function resolveTimelineBounds(
   points: readonly TimelinePoint[],
-  incidents: readonly IntegrityIncident[],
-  session: AssessmentSession,
-  cursorSeq: number,
-): { state: ReconstructedState | null; error: string | null } {
+  fallbackTimestamp = 0,
+): TimelineBounds {
+  if (points.length === 0) {
+    return {
+      minSeq: 0,
+      maxSeq: 0,
+      minTimestamp: fallbackTimestamp,
+      maxTimestamp: fallbackTimestamp,
+    }
+  }
+
+  const minSeq = points[0].seq
+  const maxSeq = points[points.length - 1].seq
+  let minTimestamp = points[0].clientTimestamp
+  let maxTimestamp = points[0].clientTimestamp
+  for (let i = 1; i < points.length; i++) {
+    const t = points[i].clientTimestamp
+    if (t < minTimestamp) minTimestamp = t
+    if (t > maxTimestamp) maxTimestamp = t
+  }
+
+  return { minSeq, maxSeq, minTimestamp, maxTimestamp }
+}
+
+/** Builds a TimelineCursor descriptor for reconstructTimeline. */
+export function buildTimelineCursor(
+  mode: CursorMode,
+  seq: number,
+  timestamp: number,
+): TimelineCursor {
+  return mode === 'seq' ? { by: 'seq', value: seq } : { by: 'timestamp', value: timestamp }
+}
+
+/** Switches cursor mode between sequence and timestamp, syncing the corresponding value. */
+export function switchCursorMode(
+  targetMode: CursorMode,
+  current: InspectorCursorState,
+  points: readonly TimelinePoint[],
+): InspectorCursorState {
+  if (targetMode === current.mode) return current
+
+  if (targetMode === 'timestamp') {
+    const matchingPoint = points.find((p) => p.seq === current.seq)
+    const timestamp = matchingPoint ? matchingPoint.clientTimestamp : current.timestamp
+    return { mode: 'timestamp', seq: current.seq, timestamp }
+  }
+
+  const included = points.filter((p) => p.clientTimestamp <= current.timestamp)
+  const latest = included[included.length - 1]
+  const seq = latest ? latest.seq : current.seq
+  return { mode: 'seq', seq, timestamp: current.timestamp }
+}
+
+/** Switches cursor mode to sequence and jumps directly to an incident evidence sequence. */
+export function jumpToEvidenceSeq(
+  evidenceSeq: number,
+  evidenceTimestamp?: number,
+): InspectorCursorState {
+  return {
+    mode: 'seq',
+    seq: evidenceSeq,
+    timestamp: evidenceTimestamp ?? 0,
+  }
+}
+
+/** Steps the timestamp cursor to the nearest preceding or succeeding point timestamp. */
+export function stepTimestamp(
+  currentTimestamp: number,
+  direction: 'back' | 'forward',
+  points: readonly TimelinePoint[],
+  bounds: TimelineBounds,
+): number {
+  if (points.length === 0) return currentTimestamp
+
+  const distinct = Array.from(new Set(points.map((p) => p.clientTimestamp))).sort((a, b) => a - b)
+  if (direction === 'back') {
+    for (let i = distinct.length - 1; i >= 0; i--) {
+      if (distinct[i] < currentTimestamp) return distinct[i]
+    }
+    return bounds.minTimestamp
+  }
+
+  for (let i = 0; i < distinct.length; i++) {
+    if (distinct[i] > currentTimestamp) return distinct[i]
+  }
+  return bounds.maxTimestamp
+}
+
+/** Pure helper to execute deterministic timeline reconstruction with initial code fallback. */
+export function reconstructInspectorTimeline(params: {
+  points: readonly TimelinePoint[]
+  incidents: readonly IntegrityIncident[]
+  session: AssessmentSession
+  cursor: TimelineCursor
+}): { state: ReconstructedState | null; error: string | null } {
+  const { points, incidents, session, cursor } = params
   try {
     return {
       state: reconstructTimeline({
         points,
         incidents,
         initialCode: session.problem.starterCode,
-        cursor: { by: 'seq', value: cursorSeq },
+        cursor,
       }),
       error: null,
     }
@@ -80,7 +199,9 @@ export function SessionTimelineInspector({
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [refreshKey, setRefreshKey] = useState(0)
+  const [cursorMode, setCursorMode] = useState<CursorMode>('seq')
   const [cursorSeq, setCursorSeq] = useState(0)
+  const [cursorTimestamp, setCursorTimestamp] = useState(session.createdAt)
 
   useEffect(() => {
     const controller = new AbortController()
@@ -94,11 +215,13 @@ export function SessionTimelineInspector({
     )
       .then((timelineData) => {
         setData(timelineData)
-        const points = projectTimelinePoints(
+        const timelinePoints = projectTimelinePoints(
           timelineData.telemetryEvents,
           timelineData.codeSnapshots,
         )
-        setCursorSeq(points[points.length - 1]?.seq ?? 0)
+        const bounds = resolveTimelineBounds(timelinePoints, session.createdAt)
+        setCursorSeq(bounds.maxSeq)
+        setCursorTimestamp(bounds.maxTimestamp)
       })
       .catch((error: unknown) => {
         if (!controller.signal.aborted) setLoadError(getActionErrorMessage(error))
@@ -108,22 +231,30 @@ export function SessionTimelineInspector({
       })
 
     return () => controller.abort()
-  }, [refreshKey, session.id])
+  }, [refreshKey, session.createdAt, session.id])
 
   const points = useMemo(
-    () => data ? projectTimelinePoints(data.telemetryEvents, data.codeSnapshots) : [],
+    () => (data ? projectTimelinePoints(data.telemetryEvents, data.codeSnapshots) : []),
     [data],
   )
   const incidents = useMemo(
-    () => data ? aggregateIntegrityIncidents(data.telemetryEvents) : [],
+    () => (data ? aggregateIntegrityIncidents(data.telemetryEvents) : []),
     [data],
   )
-  const maxSeq = points[points.length - 1]?.seq ?? 0
+  const bounds = useMemo(
+    () => resolveTimelineBounds(points, session.createdAt),
+    [points, session.createdAt],
+  )
+  const cursor = useMemo(
+    () => buildTimelineCursor(cursorMode, cursorSeq, cursorTimestamp),
+    [cursorMode, cursorSeq, cursorTimestamp],
+  )
   const reconstruction = useMemo(
-    () => data
-      ? reconstruct(points, incidents, session, cursorSeq)
-      : { state: null, error: null },
-    [cursorSeq, data, incidents, points, session],
+    () =>
+      data
+        ? reconstructInspectorTimeline({ points, incidents, session, cursor })
+        : { state: null, error: null },
+    [cursor, data, incidents, points, session],
   )
   const reconstructed = reconstruction.state
   const activeIncidentIds = new Set(
@@ -181,64 +312,193 @@ export function SessionTimelineInspector({
             </p>
           ) : (
             <div className="space-y-3 rounded-md border border-border p-3">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div>
-                  <h5 className="font-medium">Sequence scrubber</h5>
-                  <p className="text-xs text-muted-foreground">
-                    Cursor seq {cursorSeq}
-                    {reconstructed?.timestamp !== null && reconstructed?.timestamp !== undefined
-                      ? ` · ${formatTimestamp(reconstructed.timestamp)}`
-                      : ''}
-                  </p>
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border/60 pb-3">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-medium text-muted-foreground">Scrub mode:</span>
+                  <div
+                    className="inline-flex rounded-md border border-border bg-muted/20 p-0.5"
+                    role="group"
+                    aria-label="Scrub mode selector"
+                  >
+                    <Button
+                      variant={cursorMode === 'seq' ? 'default' : 'ghost'}
+                      size="sm"
+                      className="h-7 px-2.5 text-xs"
+                      onClick={() => {
+                        const next = switchCursorMode(
+                          'seq',
+                          { mode: cursorMode, seq: cursorSeq, timestamp: cursorTimestamp },
+                          points,
+                        )
+                        setCursorMode(next.mode)
+                        setCursorSeq(next.seq)
+                      }}
+                    >
+                      Sequence (seq)
+                    </Button>
+                    <Button
+                      variant={cursorMode === 'timestamp' ? 'default' : 'ghost'}
+                      size="sm"
+                      className="h-7 px-2.5 text-xs"
+                      onClick={() => {
+                        const next = switchCursorMode(
+                          'timestamp',
+                          { mode: cursorMode, seq: cursorSeq, timestamp: cursorTimestamp },
+                          points,
+                        )
+                        setCursorMode(next.mode)
+                        setCursorTimestamp(next.timestamp)
+                      }}
+                    >
+                      Timestamp (time)
+                    </Button>
+                  </div>
                 </div>
-                <div className="flex flex-wrap gap-2">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={cursorSeq <= 0}
-                    onClick={() => setCursorSeq(0)}
-                  >
-                    First
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={cursorSeq <= 0}
-                    onClick={() => setCursorSeq((seq) => Math.max(0, seq - 1))}
-                  >
-                    Step back
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={cursorSeq >= maxSeq}
-                    onClick={() => setCursorSeq((seq) => Math.min(maxSeq, seq + 1))}
-                  >
-                    Step forward
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={cursorSeq >= maxSeq}
-                    onClick={() => setCursorSeq(maxSeq)}
-                  >
-                    Latest
-                  </Button>
-                </div>
+                <span className="text-xs text-muted-foreground">
+                  {cursorMode === 'seq'
+                    ? 'Deterministic sequence ordering'
+                    : 'Client timestamp filtering'}
+                </span>
               </div>
-              <input
-                type="range"
-                min={0}
-                max={maxSeq}
-                step={1}
-                value={Math.min(cursorSeq, maxSeq)}
-                aria-label="Timeline sequence"
-                className="w-full accent-primary"
-                onChange={(event) => setCursorSeq(Number(event.target.value))}
-              />
-              <p className="text-xs text-muted-foreground">
-                Sequence is shared by telemetry events and code snapshots. Missing sequence values are skipped by the history.
-              </p>
+
+              {cursorMode === 'seq' ? (
+                <>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <h5 className="font-medium">Sequence scrubber</h5>
+                      <p className="text-xs text-muted-foreground">
+                        Cursor seq {cursorSeq}
+                        {reconstructed?.timestamp !== null && reconstructed?.timestamp !== undefined
+                          ? ` · ${formatTimestamp(reconstructed.timestamp)}`
+                          : ''}
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={cursorSeq <= 0}
+                        onClick={() => setCursorSeq(0)}
+                      >
+                        First
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={cursorSeq <= 0}
+                        onClick={() => setCursorSeq((seq) => Math.max(0, seq - 1))}
+                      >
+                        Step back
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={cursorSeq >= bounds.maxSeq}
+                        onClick={() => setCursorSeq((seq) => Math.min(bounds.maxSeq, seq + 1))}
+                      >
+                        Step forward
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={cursorSeq >= bounds.maxSeq}
+                        onClick={() => setCursorSeq(bounds.maxSeq)}
+                      >
+                        Latest
+                      </Button>
+                    </div>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={bounds.maxSeq}
+                    step={1}
+                    value={Math.min(cursorSeq, bounds.maxSeq)}
+                    aria-label="Timeline sequence"
+                    className="w-full accent-primary"
+                    onChange={(event) => setCursorSeq(Number(event.target.value))}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {SEQUENCE_SCRUBBING_NOTE}
+                  </p>
+                </>
+              ) : (
+                <>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <h5 className="font-medium">Timestamp scrubber</h5>
+                      <p className="text-xs text-muted-foreground">
+                        Cursor time: {formatTimestamp(cursorTimestamp)}
+                        {reconstructed?.seq !== null && reconstructed?.seq !== undefined
+                          ? ` · at seq ${reconstructed.seq}`
+                          : ' · before first event'}
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={cursorTimestamp <= bounds.minTimestamp}
+                        onClick={() => setCursorTimestamp(bounds.minTimestamp)}
+                      >
+                        First
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={cursorTimestamp <= bounds.minTimestamp}
+                        onClick={() =>
+                          setCursorTimestamp((current) =>
+                            stepTimestamp(current, 'back', points, bounds),
+                          )
+                        }
+                      >
+                        Step back
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={cursorTimestamp >= bounds.maxTimestamp}
+                        onClick={() =>
+                          setCursorTimestamp((current) =>
+                            stepTimestamp(current, 'forward', points, bounds),
+                          )
+                        }
+                      >
+                        Step forward
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={cursorTimestamp >= bounds.maxTimestamp}
+                        onClick={() => setCursorTimestamp(bounds.maxTimestamp)}
+                      >
+                        Latest
+                      </Button>
+                    </div>
+                  </div>
+                  <input
+                    type="range"
+                    min={bounds.minTimestamp}
+                    max={
+                      bounds.maxTimestamp > bounds.minTimestamp
+                        ? bounds.maxTimestamp
+                        : bounds.minTimestamp + 1
+                    }
+                    step={1}
+                    value={Math.min(
+                      Math.max(cursorTimestamp, bounds.minTimestamp),
+                      bounds.maxTimestamp,
+                    )}
+                    aria-label="Timeline timestamp"
+                    className="w-full accent-primary"
+                    onChange={(event) => setCursorTimestamp(Number(event.target.value))}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {TIMESTAMP_SCRUBBING_NOTE}
+                  </p>
+                </>
+              )}
             </div>
           )}
 
@@ -346,7 +606,15 @@ export function SessionTimelineInspector({
                             key={`${incident.id}:${evidence.seq}`}
                             variant="outline"
                             size="sm"
-                            onClick={() => setCursorSeq(evidence.seq)}
+                            onClick={() => {
+                              const next = jumpToEvidenceSeq(
+                                evidence.seq,
+                                evidence.clientTimestamp,
+                              )
+                              setCursorMode(next.mode)
+                              setCursorSeq(next.seq)
+                              setCursorTimestamp(next.timestamp)
+                            }}
                           >
                             seq {evidence.seq} · {evidence.eventType} · {formatTimestamp(evidence.clientTimestamp)}
                           </Button>
