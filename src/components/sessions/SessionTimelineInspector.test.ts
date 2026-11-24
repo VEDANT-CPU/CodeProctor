@@ -4,14 +4,20 @@ import type { TimelinePoint, CodeDelta, SnapshotTimelinePoint } from '../../doma
 import type { TelemetryEvent, SnapshotTrigger } from '../../domain/telemetry'
 import {
   buildTimelineCursor,
+  canStartRefreshRequest,
+  hasTimelineDataChanged,
   jumpToEvidenceSeq,
+  reconcileCursorOnRefresh,
   reconstructInspectorTimeline,
   resolveTimelineBounds,
+  shouldAutoRefresh,
   stepTimestamp,
   switchCursorMode,
+  DEFAULT_LIVE_REFRESH_INTERVAL_MS,
   SEQUENCE_SCRUBBING_NOTE,
   TIMESTAMP_SCRUBBING_NOTE,
 } from './SessionTimelineInspector'
+import type { SessionTimelineData } from './SessionTimelineInspector'
 
 function createSession(starterCode = 'function solve() {\n  return 0\n}'): AssessmentSession {
   return {
@@ -400,6 +406,152 @@ describe('SessionTimelineInspector helpers and timeline reconstruction', () => {
       expect(TIMESTAMP_SCRUBBING_NOTE).toContain('clientTimestamp')
       expect(TIMESTAMP_SCRUBBING_NOTE).toContain('monotonic sequence order')
       expect(SEQUENCE_SCRUBBING_NOTE).toContain('Sequence is shared by telemetry events and code snapshots')
+    })
+  })
+
+  describe('live auto-refresh decisions and helpers', () => {
+    it('runs shouldAutoRefresh only when session is active, inspector is open, and unpaused', () => {
+      expect(shouldAutoRefresh({ status: 'active', isPaused: false, isOpen: true })).toBe(true)
+      expect(shouldAutoRefresh({ status: 'active', isPaused: false })).toBe(true)
+
+      // Paused
+      expect(shouldAutoRefresh({ status: 'active', isPaused: true, isOpen: true })).toBe(false)
+
+      // Closed
+      expect(shouldAutoRefresh({ status: 'active', isPaused: false, isOpen: false })).toBe(false)
+
+      // Terminal or non-active statuses
+      expect(shouldAutoRefresh({ status: 'submitted', isPaused: false, isOpen: true })).toBe(false)
+      expect(shouldAutoRefresh({ status: 'timed_out', isPaused: false, isOpen: true })).toBe(false)
+      expect(shouldAutoRefresh({ status: 'pending', isPaused: false, isOpen: true })).toBe(false)
+    })
+
+    it('detects whether incoming timeline data has changed', () => {
+      const baseData: SessionTimelineData = {
+        sessionId: 'session-1',
+        telemetryEvents: [
+          {
+            candidateId: 'cand-1',
+            serverReceivedAt: 1_000,
+            sessionId: 'session-1',
+            seq: 1,
+            clientTimestamp: 1_000,
+            type: 'FOCUS_LOST',
+            payload: { visibility: 'hidden', trigger: 'visibilitychange' },
+          },
+        ],
+        codeSnapshots: [],
+        nextSeq: 2,
+      }
+
+      // Initial load (previous is null)
+      expect(hasTimelineDataChanged(null, baseData)).toBe(true)
+
+      // Identical data
+      const identicalData: SessionTimelineData = {
+        sessionId: 'session-1',
+        telemetryEvents: [...baseData.telemetryEvents],
+        codeSnapshots: [],
+        nextSeq: 2,
+      }
+      expect(hasTimelineDataChanged(baseData, identicalData)).toBe(false)
+
+      // Session ID changed
+      expect(hasTimelineDataChanged(baseData, { ...baseData, sessionId: 'session-2' })).toBe(true)
+
+      // nextSeq changed
+      expect(hasTimelineDataChanged(baseData, { ...baseData, nextSeq: 3 })).toBe(true)
+
+      // New telemetry event count changed
+      expect(
+        hasTimelineDataChanged(baseData, {
+          ...baseData,
+          telemetryEvents: [
+            ...baseData.telemetryEvents,
+            {
+              candidateId: 'cand-1',
+              serverReceivedAt: 2_000,
+              sessionId: 'session-1',
+              seq: 2,
+              clientTimestamp: 2_000,
+              type: 'FOCUS_RESTORED',
+              payload: { visibility: 'visible' },
+            },
+          ],
+        }),
+      ).toBe(true)
+
+      // Code snapshot count changed
+      expect(
+        hasTimelineDataChanged(baseData, {
+          ...baseData,
+          codeSnapshots: [
+            {
+              candidateId: 'cand-1',
+              serverReceivedAt: 3_000,
+              sessionId: 'session-1',
+              snapshotId: 'snap-1',
+              seq: 3,
+              clientTimestamp: 3_000,
+              trigger: 'periodic',
+              code: 'code',
+            },
+          ],
+        }),
+      ).toBe(true)
+    })
+
+    it('guards against overlapping requests and mismatched session targets', () => {
+      // In flight
+      expect(canStartRefreshRequest(true, 'session-1', 'session-1')).toBe(false)
+
+      // Target session ID empty
+      expect(canStartRefreshRequest(false, 'session-1', '')).toBe(false)
+
+      // Target session mismatch
+      expect(canStartRefreshRequest(false, 'session-1', 'session-2')).toBe(false)
+
+      // Valid request
+      expect(canStartRefreshRequest(false, 'session-1', 'session-1')).toBe(true)
+      expect(canStartRefreshRequest(false, null, 'session-1')).toBe(true)
+    })
+
+    it('reconciles cursor on refresh without yanking active scrub position when new records arrive', () => {
+      // On initial load: cursor moves to latest seq and timestamp
+      const initial = reconcileCursorOnRefresh({
+        currentCursor: { mode: 'seq', seq: 0, timestamp: 0 },
+        newBounds: { minSeq: 1, maxSeq: 10, minTimestamp: 1_000, maxTimestamp: 10_000 },
+        isFirstLoad: true,
+      })
+      expect(initial).toEqual({
+        mode: 'seq',
+        seq: 10,
+        timestamp: 10_000,
+      })
+
+      // On subsequent refresh when proctor is actively inspecting seq 4 and new records arrive (maxSeq 10 -> 20)
+      const afterNewRecords = reconcileCursorOnRefresh({
+        currentCursor: { mode: 'seq', seq: 4, timestamp: 4_000 },
+        newBounds: { minSeq: 1, maxSeq: 20, minTimestamp: 1_000, maxTimestamp: 20_000 },
+        isFirstLoad: false,
+      })
+      // Proctor's cursor stays at seq 4 (not yanked to 20!)
+      expect(afterNewRecords.seq).toBe(4)
+      expect(afterNewRecords.timestamp).toBe(4_000)
+
+      // Out-of-bounds cursor is clamped safely
+      const clamped = reconcileCursorOnRefresh({
+        currentCursor: { mode: 'seq', seq: 25, timestamp: 25_000 },
+        newBounds: { minSeq: 1, maxSeq: 20, minTimestamp: 1_000, maxTimestamp: 20_000 },
+        isFirstLoad: false,
+      })
+      expect(clamped.seq).toBe(20)
+      expect(clamped.timestamp).toBe(20_000)
+    })
+
+    it('exposes sensible default live refresh interval (~4s)', () => {
+      expect(DEFAULT_LIVE_REFRESH_INTERVAL_MS).toBeGreaterThanOrEqual(4_000)
+      expect(DEFAULT_LIVE_REFRESH_INTERVAL_MS).toBeLessThanOrEqual(5_000)
     })
   })
 })

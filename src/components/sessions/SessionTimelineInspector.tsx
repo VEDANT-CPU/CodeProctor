@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { AssessmentSession } from '../../domain/session'
 import { aggregateIntegrityIncidents } from '../../domain/incidents'
 import type { IntegrityIncident } from '../../domain/incidents'
@@ -8,17 +8,17 @@ import type { CodeSnapshot, TelemetryEvent } from '../../domain/telemetry'
 import { callWorkerAction, getActionErrorMessage } from '../../lib/action-client'
 import { Badge, Button, Textarea } from '../ui'
 
-type PersistedTelemetryEvent = TelemetryEvent & {
+export type PersistedTelemetryEvent = TelemetryEvent & {
   candidateId: string
   serverReceivedAt: number
 }
 
-type PersistedCodeSnapshot = CodeSnapshot & {
+export type PersistedCodeSnapshot = CodeSnapshot & {
   candidateId: string
   serverReceivedAt: number
 }
 
-interface SessionTimelineData {
+export interface SessionTimelineData {
   sessionId: string
   telemetryEvents: PersistedTelemetryEvent[]
   codeSnapshots: PersistedCodeSnapshot[]
@@ -48,6 +48,15 @@ export interface TimelineBounds {
   maxTimestamp: number
 }
 
+/** Default polling interval in milliseconds for live auto-refresh while session is active. */
+export const DEFAULT_LIVE_REFRESH_INTERVAL_MS = 4_000
+
+export interface ShouldAutoRefreshParams {
+  status: AssessmentSession['status']
+  isPaused: boolean
+  isOpen?: boolean
+}
+
 /** Explanation note displayed during timestamp scrubbing. */
 export const TIMESTAMP_SCRUBBING_NOTE =
   'Timestamp scrubbing filters timeline events and snapshots whose clientTimestamp is at or before the cursor, while code state and active flags are reconstructed in monotonic sequence order. If events arrived with divergent client clocks or out-of-order flushes, a non-prefix set of sequence points may be included.'
@@ -72,6 +81,67 @@ export function pointLabel(point: TimelinePoint): string {
 
 export function incidentMetrics(incident: IntegrityIncident): readonly [string, number][] {
   return Object.entries(incident.metrics)
+}
+
+/** Determines whether live auto-refresh should run for a given session status, paused state, and inspector open state. */
+export function shouldAutoRefresh(params: ShouldAutoRefreshParams): boolean {
+  const { status, isPaused, isOpen = true } = params
+  if (!isOpen) return false
+  if (isPaused) return false
+  return status === 'active'
+}
+
+/** Detects whether incoming timeline data contains new records or advanced sequence space. */
+export function hasTimelineDataChanged(
+  previous: SessionTimelineData | null,
+  incoming: SessionTimelineData,
+): boolean {
+  if (!previous) return true
+  if (previous.sessionId !== incoming.sessionId) return true
+  if (previous.nextSeq !== incoming.nextSeq) return true
+  if (previous.telemetryEvents.length !== incoming.telemetryEvents.length) return true
+  if (previous.codeSnapshots.length !== incoming.codeSnapshots.length) return true
+  return false
+}
+
+/** Guards against overlapping concurrent fetch requests or mismatched session targets. */
+export function canStartRefreshRequest(
+  inFlight: boolean,
+  activeSessionId: string | null,
+  targetSessionId: string,
+): boolean {
+  if (inFlight) return false
+  if (!targetSessionId) return false
+  if (activeSessionId && activeSessionId !== targetSessionId) return false
+  return true
+}
+
+/** Reconciles cursor position on refresh without yanking the active scrub cursor when new records arrive. */
+export function reconcileCursorOnRefresh(params: {
+  currentCursor: InspectorCursorState
+  newBounds: TimelineBounds
+  isFirstLoad: boolean
+}): InspectorCursorState {
+  const { currentCursor, newBounds, isFirstLoad } = params
+  if (isFirstLoad) {
+    return {
+      mode: currentCursor.mode,
+      seq: newBounds.maxSeq,
+      timestamp: newBounds.maxTimestamp,
+    }
+  }
+
+  const clampedSeq = Math.min(Math.max(0, currentCursor.seq), newBounds.maxSeq)
+  const clampedTimestamp =
+    newBounds.maxTimestamp > newBounds.minTimestamp
+      ? Math.min(Math.max(newBounds.minTimestamp, currentCursor.timestamp), newBounds.maxTimestamp)
+      : newBounds.maxTimestamp
+
+  return {
+    mode: currentCursor.mode,
+    seq: clampedSeq,
+    timestamp: clampedTimestamp,
+  }
 }
 
 /** Computes timeline sequence and timestamp boundary values across all points. */
@@ -197,41 +267,122 @@ export function SessionTimelineInspector({
 }: SessionTimelineInspectorProps) {
   const [data, setData] = useState<SessionTimelineData | null>(null)
   const [loading, setLoading] = useState(true)
+  const [isPolling, setIsPolling] = useState(false)
+  const [isPaused, setIsPaused] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [refreshKey, setRefreshKey] = useState(0)
   const [cursorMode, setCursorMode] = useState<CursorMode>('seq')
   const [cursorSeq, setCursorSeq] = useState(0)
   const [cursorTimestamp, setCursorTimestamp] = useState(session.createdAt)
 
+  const inFlightRef = useRef(false)
+  const previousDataRef = useRef<SessionTimelineData | null>(null)
+  const currentSessionIdRef = useRef(session.id)
+
+  if (currentSessionIdRef.current !== session.id) {
+    currentSessionIdRef.current = session.id
+    previousDataRef.current = null
+  }
+
+  const fetchTimelineData = useCallback(
+    async (isManualOrInitial: boolean, signal?: AbortSignal) => {
+      if (!canStartRefreshRequest(inFlightRef.current, session.id, session.id)) {
+        return
+      }
+      inFlightRef.current = true
+      if (isManualOrInitial) {
+        setLoading(true)
+        setLoadError(null)
+      } else {
+        setIsPolling(true)
+      }
+
+      try {
+        const timelineData = await callWorkerAction<SessionTimelineData>(
+          'get_session_timeline_data',
+          { sessionId: session.id },
+          signal,
+        )
+        if (signal?.aborted) return
+
+        const isFirstLoad = previousDataRef.current === null
+        if (isFirstLoad || hasTimelineDataChanged(previousDataRef.current, timelineData)) {
+          setData(timelineData)
+          previousDataRef.current = timelineData
+          const timelinePoints = projectTimelinePoints(
+            timelineData.telemetryEvents,
+            timelineData.codeSnapshots,
+          )
+          const newBounds = resolveTimelineBounds(timelinePoints, session.createdAt)
+
+          if (isFirstLoad) {
+            setCursorSeq(newBounds.maxSeq)
+            setCursorTimestamp(newBounds.maxTimestamp)
+          } else {
+            setCursorSeq((prevSeq) =>
+              reconcileCursorOnRefresh({
+                currentCursor: { mode: 'seq', seq: prevSeq, timestamp: 0 },
+                newBounds,
+                isFirstLoad: false,
+              }).seq,
+            )
+            setCursorTimestamp((prevTime) =>
+              reconcileCursorOnRefresh({
+                currentCursor: { mode: 'timestamp', seq: 0, timestamp: prevTime },
+                newBounds,
+                isFirstLoad: false,
+              }).timestamp,
+            )
+          }
+        }
+        setLoadError(null)
+      } catch (error: unknown) {
+        if (!signal?.aborted) {
+          setLoadError(getActionErrorMessage(error))
+        }
+      } finally {
+        inFlightRef.current = false
+        if (!signal?.aborted) {
+          if (isManualOrInitial) setLoading(false)
+          setIsPolling(false)
+        }
+      }
+    },
+    [session.createdAt, session.id],
+  )
+
   useEffect(() => {
     const controller = new AbortController()
-    setLoading(true)
-    setLoadError(null)
 
-    callWorkerAction<SessionTimelineData>(
-      'get_session_timeline_data',
-      { sessionId: session.id },
-      controller.signal,
-    )
-      .then((timelineData) => {
-        setData(timelineData)
-        const timelinePoints = projectTimelinePoints(
-          timelineData.telemetryEvents,
-          timelineData.codeSnapshots,
-        )
-        const bounds = resolveTimelineBounds(timelinePoints, session.createdAt)
-        setCursorSeq(bounds.maxSeq)
-        setCursorTimestamp(bounds.maxTimestamp)
-      })
-      .catch((error: unknown) => {
-        if (!controller.signal.aborted) setLoadError(getActionErrorMessage(error))
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) setLoading(false)
-      })
+    void fetchTimelineData(true, controller.signal)
 
-    return () => controller.abort()
-  }, [refreshKey, session.createdAt, session.id])
+    let timerId: ReturnType<typeof setTimeout> | null = null
+
+    function schedulePoll() {
+      if (!shouldAutoRefresh({ status: session.status, isPaused, isOpen: true })) {
+        return
+      }
+      timerId = setTimeout(async () => {
+        if (controller.signal.aborted) return
+        if (shouldAutoRefresh({ status: session.status, isPaused, isOpen: true })) {
+          await fetchTimelineData(false, controller.signal)
+        }
+        if (
+          !controller.signal.aborted &&
+          shouldAutoRefresh({ status: session.status, isPaused, isOpen: true })
+        ) {
+          schedulePoll()
+        }
+      }, DEFAULT_LIVE_REFRESH_INTERVAL_MS)
+    }
+
+    schedulePoll()
+
+    return () => {
+      controller.abort()
+      if (timerId) clearTimeout(timerId)
+    }
+  }, [fetchTimelineData, isPaused, refreshKey, session.id, session.status])
 
   const points = useMemo(
     () => (data ? projectTimelinePoints(data.telemetryEvents, data.codeSnapshots) : []),
@@ -269,12 +420,34 @@ export function SessionTimelineInspector({
     >
       <header className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h4 className="font-semibold">Session timeline inspector</h4>
+          <div className="flex flex-wrap items-center gap-2">
+            <h4 className="font-semibold">Session timeline inspector</h4>
+            {session.status === 'active' && (
+              <Badge variant={isPaused ? 'outline' : 'default'} className="text-[10px]">
+                {isPaused ? 'Live paused' : isPolling ? 'Live refreshing…' : 'Live (~4s)'}
+              </Badge>
+            )}
+            {session.status !== 'active' && (
+              <Badge variant="outline" className="text-[10px]">
+                {session.status} (live paused)
+              </Badge>
+            )}
+          </div>
           <p className="mt-1 break-all text-xs text-muted-foreground">
             Complete persisted history · session {session.id}
           </p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
+          {session.status === 'active' && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setIsPaused((prev) => !prev)}
+              aria-label={isPaused ? 'Resume live refresh' : 'Pause live refresh'}
+            >
+              {isPaused ? 'Resume live' : 'Pause live'}
+            </Button>
+          )}
           <Button
             variant="outline"
             size="sm"
