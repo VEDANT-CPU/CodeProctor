@@ -9,6 +9,7 @@ import { callWorkerAction, getActionErrorMessage } from '../../lib/action-client
 import { Badge, Button, buttonVariants } from '../ui'
 import { CandidateSessionEntry, SessionStatus } from './CandidateSessionEntry'
 import { CreateSessionForm } from './CreateSessionForm'
+import { SessionTimelineInspector } from './SessionTimelineInspector'
 
 type PersistedTelemetryEvent = TelemetryEvent & { candidateId: string }
 type PersistedCodeSnapshot = CodeSnapshot & { candidateId: string }
@@ -44,6 +45,7 @@ function ProctorSessionList() {
   const [createdSessions, setCreatedSessions] = useState<AssessmentSession[]>([])
   const [startingSessionId, setStartingSessionId] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
 
   const storedSessions = records.map((record: RecordData<AssessmentSession>) => ({
     ...record.data,
@@ -183,7 +185,24 @@ function ProctorSessionList() {
                     >
                       Open workspace
                     </Link>
+                    <Button
+                      variant={selectedSessionId === session.id ? 'default' : 'outline'}
+                      aria-expanded={selectedSessionId === session.id}
+                      onClick={() =>
+                        setSelectedSessionId((selected) =>
+                          selected === session.id ? null : session.id,
+                        )
+                      }
+                    >
+                      {selectedSessionId === session.id ? 'Timeline open' : 'Inspect timeline'}
+                    </Button>
                   </div>
+                  {selectedSessionId === session.id && (
+                    <SessionTimelineInspector
+                      session={session}
+                      onClose={() => setSelectedSessionId(null)}
+                    />
+                  )}
                 </article>
               )
             })}

@@ -32,6 +32,7 @@ import type { Env } from '../../worker.js'
 const COLLECTION = 'assessment-sessions'
 const TELEMETRY_COLLECTION = 'telemetry-events'
 const SNAPSHOT_COLLECTION = 'code-snapshots'
+const MAX_CLIENT_CLOCK_SKEW_MS = 5 * 60_000
 
 type StoredAssessmentSession = AssessmentSession & Record<string, unknown>
 type ActionFailure = Extract<ActionResult, { success: false }>
@@ -54,6 +55,17 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function isNonNegativeSafeInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+
+function isClientTimestampPlausible(
+  clientTimestamp: number,
+  serverReceivedAt: number,
+  sessionCreatedAt: number,
+  isOfflineFlush: boolean,
+): boolean {
+  if (clientTimestamp > serverReceivedAt + MAX_CLIENT_CLOCK_SKEW_MS) return false
+  if (clientTimestamp < sessionCreatedAt - MAX_CLIENT_CLOCK_SKEW_MS) return false
+  return isOfflineFlush || clientTimestamp >= serverReceivedAt - MAX_CLIENT_CLOCK_SKEW_MS
 }
 
 function isTelemetryEvent(value: unknown): value is TelemetryEvent {
@@ -468,8 +480,18 @@ export const ingestTelemetryBatch: ActionHandler<Env> = async (context) => {
 
   const uniqueOrderedEvents = orderTelemetryEvents(events)
   const now = Date.now()
-  let acceptedCount = 0
+  const isOfflineFlush = rawBatch.isOfflineFlush === true
+  const newEvents: TelemetryEvent[] = []
+  let previousClientTimestamp: number | null = null
   for (const event of uniqueOrderedEvents) {
+    if (previousClientTimestamp !== null && event.clientTimestamp < previousClientTimestamp) {
+      return failure(
+        'Telemetry timestamps are outside the allowed clock-skew window or out of sequence',
+        'invalid_timestamp',
+      )
+    }
+    previousClientTimestamp = event.clientTimestamp
+
     const snapshotSequence = await findExistingSequence(
       context.tools,
       SNAPSHOT_COLLECTION,
@@ -489,7 +511,27 @@ export const ingestTelemetryBatch: ActionHandler<Env> = async (context) => {
     )
     if (isActionFailure(existing)) return existing
     if (existing) continue
+    newEvents.push(event)
+  }
 
+  for (const event of newEvents) {
+    if (
+      !isClientTimestampPlausible(
+        event.clientTimestamp,
+        now,
+        loaded.session.createdAt,
+        isOfflineFlush,
+      )
+    ) {
+      return failure(
+        'Telemetry timestamps are outside the allowed clock-skew window or out of sequence',
+        'invalid_timestamp',
+      )
+    }
+  }
+
+  let acceptedCount = 0
+  for (const event of newEvents) {
     const storedEvent = {
       ...event,
       candidateId: loaded.session.candidateId,
@@ -531,9 +573,10 @@ export const recordCodeSnapshot: ActionHandler<Env> = async (context) => {
     typeof rawSnapshot.trigger !== 'string' ||
     !snapshotTriggers.includes(rawSnapshot.trigger as SnapshotTrigger) ||
     typeof rawSnapshot.code !== 'string' ||
-    (rawSnapshot.suiteId !== undefined && typeof rawSnapshot.suiteId !== 'string')
+    (rawSnapshot.suiteId !== undefined && typeof rawSnapshot.suiteId !== 'string') ||
+    (rawSnapshot.isOfflineFlush !== undefined && typeof rawSnapshot.isOfflineFlush !== 'boolean')
   ) {
-    return missingParam('snapshot fields')
+    return missingParam('snapshot fields or isOfflineFlush')
   }
 
   const actorResult = await resolveActor(context)
@@ -574,6 +617,20 @@ export const recordCodeSnapshot: ActionHandler<Env> = async (context) => {
   if (isActionFailure(existing)) return existing
 
   const now = Date.now()
+  if (
+    !existing &&
+    !isClientTimestampPlausible(
+      orderedSnapshot.clientTimestamp,
+      now,
+      loaded.session.createdAt,
+      rawSnapshot.isOfflineFlush === true,
+    )
+  ) {
+    return failure(
+      'Snapshot timestamp is outside the allowed clock-skew window',
+      'invalid_timestamp',
+    )
+  }
   if (!existing) {
     const created = await context.tools.create(
       SNAPSHOT_COLLECTION,
@@ -599,6 +656,185 @@ export const recordCodeSnapshot: ActionHandler<Env> = async (context) => {
       lastSeenAt: now,
     },
   }
+}
+
+type PersistedTelemetryEvent = TelemetryEvent & {
+  candidateId: string
+  serverReceivedAt: number
+}
+
+type PersistedCodeSnapshot = CodeSnapshot & {
+  candidateId: string
+  serverReceivedAt: number
+}
+
+function isPersistedTelemetryEvent(value: unknown): value is PersistedTelemetryEvent {
+  if (
+    !isObject(value) ||
+    typeof value.candidateId !== 'string' ||
+    !isNonNegativeSafeInteger(value.serverReceivedAt)
+  ) {
+    return false
+  }
+  return isTelemetryEvent(value)
+}
+
+function isPersistedCodeSnapshot(value: unknown): value is PersistedCodeSnapshot {
+  return (
+    isObject(value) &&
+    typeof value.snapshotId === 'string' &&
+    value.snapshotId.trim().length > 0 &&
+    typeof value.sessionId === 'string' &&
+    typeof value.seq === 'number' &&
+    isValidSequenceNumber(value.seq) &&
+    isNonNegativeSafeInteger(value.clientTimestamp) &&
+    isNonNegativeSafeInteger(value.serverReceivedAt) &&
+    typeof value.trigger === 'string' &&
+    snapshotTriggers.includes(value.trigger as SnapshotTrigger) &&
+    typeof value.code === 'string' &&
+    (value.suiteId === undefined || typeof value.suiteId === 'string') &&
+    typeof value.candidateId === 'string'
+  )
+}
+
+export const getSessionTimelineData: ActionHandler<Env> = async (context) => {
+  const sessionId = context.params.sessionId
+  if (typeof sessionId !== 'string' || !sessionId.trim()) return missingParam('sessionId')
+
+  const actorResult = await resolveActor(context)
+  if (isActionResult(actorResult)) return actorResult
+  const loaded = await loadSession(context.tools, sessionId)
+  if (!loaded.success) return loaded.result
+  const sessionContext = toSessionContext(loaded.session)
+  if (
+    !authorizeActorSession(actorResult.actor, sessionContext) ||
+    !authorizeActorAction(actorResult.actor, 'view_session', sessionContext)
+  ) {
+    return failure('Forbidden', 'forbidden')
+  }
+
+  const [telemetryResult, snapshotResult] = await Promise.all([
+    context.tools.query<Record<string, unknown>>(TELEMETRY_COLLECTION, {
+      where: { sessionId },
+      orderBy: 'seq',
+      orderDir: 'asc',
+    }),
+    context.tools.query<Record<string, unknown>>(SNAPSHOT_COLLECTION, {
+      where: { sessionId },
+      orderBy: 'seq',
+      orderDir: 'asc',
+    }),
+  ])
+  if (!telemetryResult.success) return telemetryResult
+  if (!snapshotResult.success) return snapshotResult
+
+  const telemetryEvents: PersistedTelemetryEvent[] = []
+  for (const record of telemetryResult.data.records) {
+    const data = record.data
+    if (record.recordId !== `${sessionId}:${String(data.seq)}` || !isPersistedTelemetryEvent(data)) {
+      return failure('Stored telemetry record is invalid', 'invalid_timeline_record')
+    }
+    if (data.sessionId !== sessionId || data.candidateId !== loaded.session.candidateId) {
+      return failure('Stored telemetry record is invalid', 'invalid_timeline_record')
+    }
+    telemetryEvents.push(data)
+  }
+
+  const codeSnapshots: PersistedCodeSnapshot[] = []
+  for (const record of snapshotResult.data.records) {
+    if (
+      record.recordId !== `${sessionId}:${String(record.data.seq)}` ||
+      !isPersistedCodeSnapshot(record.data) ||
+      record.data.sessionId !== sessionId ||
+      record.data.candidateId !== loaded.session.candidateId
+    ) {
+      return failure('Stored code snapshot is invalid', 'invalid_timeline_record')
+    }
+    codeSnapshots.push(record.data)
+  }
+
+  const seenSequences = new Set<number>()
+  for (const point of [...telemetryEvents, ...codeSnapshots]) {
+    if (seenSequences.has(point.seq)) {
+      return failure('Timeline contains a duplicate sequence number', 'sequence_conflict')
+    }
+    seenSequences.add(point.seq)
+  }
+  let highestSequence = 0
+  for (const seq of seenSequences) highestSequence = Math.max(highestSequence, seq)
+  const nextSeq = highestSequence + 1
+  if (!isValidSequenceNumber(nextSeq)) {
+    return failure('Timeline sequence space is exhausted', 'sequence_exhausted')
+  }
+
+  return {
+    success: true,
+    data: {
+      sessionId,
+      telemetryEvents,
+      codeSnapshots,
+      nextSeq,
+    },
+  }
+}
+
+export const getSessionTimelineSequence: ActionHandler<Env> = async (context) => {
+  const sessionId = context.params.sessionId
+  if (typeof sessionId !== 'string' || !sessionId.trim()) return missingParam('sessionId')
+
+  const actorResult = await resolveActor(context)
+  if (isActionResult(actorResult)) return actorResult
+  const loaded = await loadSession(context.tools, sessionId)
+  if (!loaded.success) return loaded.result
+  const sessionContext = toSessionContext(loaded.session)
+  if (
+    !authorizeActorSession(actorResult.actor, sessionContext) ||
+    !authorizeActorAction(actorResult.actor, 'view_session', sessionContext)
+  ) {
+    return failure('Forbidden', 'forbidden')
+  }
+
+  const [telemetryResult, snapshotResult] = await Promise.all([
+    context.tools.query<Record<string, unknown>>(TELEMETRY_COLLECTION, {
+      where: { sessionId },
+      orderBy: 'seq',
+      orderDir: 'desc',
+      limit: 1,
+    }),
+    context.tools.query<Record<string, unknown>>(SNAPSHOT_COLLECTION, {
+      where: { sessionId },
+      orderBy: 'seq',
+      orderDir: 'desc',
+      limit: 1,
+    }),
+  ])
+  if (!telemetryResult.success) return telemetryResult
+  if (!snapshotResult.success) return snapshotResult
+
+  let highestSequence = 0
+  for (const record of [
+    ...telemetryResult.data.records,
+    ...snapshotResult.data.records,
+  ]) {
+    const data = record.data
+    if (
+      !isObject(data) ||
+      data.sessionId !== sessionId ||
+      data.candidateId !== loaded.session.candidateId ||
+      typeof data.seq !== 'number' ||
+      !isValidSequenceNumber(data.seq) ||
+      record.recordId !== `${sessionId}:${data.seq}`
+    ) {
+      return failure('Stored timeline record is invalid', 'invalid_timeline_record')
+    }
+    highestSequence = Math.max(highestSequence, data.seq)
+  }
+
+  const nextSeq = highestSequence + 1
+  if (!isValidSequenceNumber(nextSeq)) {
+    return failure('Timeline sequence space is exhausted', 'sequence_exhausted')
+  }
+  return { success: true, data: { sessionId, nextSeq } }
 }
 
 export const updateSessionConnection: ActionHandler<Env> = async (context) => {
@@ -644,5 +880,7 @@ export const assessmentSessionActions: Record<string, ActionHandler<Env>> = {
   submit_assessment_session: submitAssessmentSession,
   ingest_telemetry_batch: ingestTelemetryBatch,
   record_code_snapshot: recordCodeSnapshot,
+  get_session_timeline_data: getSessionTimelineData,
+  get_session_timeline_sequence: getSessionTimelineSequence,
   update_session_connection: updateSessionConnection,
 }

@@ -72,12 +72,34 @@ export interface ReconstructedState {
 export interface ReconstructTimelineOptions {
   /** Ordered or unordered points from exactly one assessment session. */
   points: readonly TimelinePoint[]
+  /** Initial source state to use when no included snapshot exists. */
+  initialCode?: string
   /** Sequence or client-time position to scrub to. */
   cursor: TimelineCursor
   /** Deterministic incidents to reveal once their evidence is in the past. */
   incidents?: readonly IntegrityIncident[]
   /** Number of points to include on each side of the cursor. Defaults to 3. */
   nearbyPointRadius?: number
+}
+
+/**
+ * Adds timeline discriminators to persisted rows and orders the combined
+ * session stream by its shared sequence number.
+ */
+export function projectTimelinePoints(
+  telemetryEvents: readonly TelemetryEvent[],
+  codeSnapshots: readonly CodeSnapshot[],
+): TimelinePoint[] {
+  return [
+    ...telemetryEvents.map((event): TelemetryTimelinePoint => ({
+      ...event,
+      kind: 'telemetry',
+    })),
+    ...codeSnapshots.map((snapshot): SnapshotTimelinePoint => ({
+      ...snapshot,
+      kind: 'snapshot',
+    })),
+  ].sort((left, right) => left.seq - right.seq)
 }
 
 /**
@@ -119,7 +141,7 @@ export function reconstructTimeline(options: ReconstructTimelineOptions): Recons
 
   const includedPoints = orderedPoints.filter((point) => isAtOrBeforeCursor(point, cursor))
   const latestIncludedPoint = includedPoints[includedPoints.length - 1]
-  const state = reconstructCodeAndFlags(includedPoints)
+  const state = reconstructCodeAndFlags(includedPoints, options.initialCode ?? '')
   const cursorSeq = latestIncludedPoint?.seq ?? null
   const cursorTimestamp =
     cursor.by === 'timestamp' ? cursor.value : (latestIncludedPoint?.clientTimestamp ?? null)
@@ -149,11 +171,11 @@ export function reconstructTimeline(options: ReconstructTimelineOptions): Recons
   }
 }
 
-function reconstructCodeAndFlags(points: readonly TimelinePoint[]): {
+function reconstructCodeAndFlags(points: readonly TimelinePoint[], initialCode: string): {
   code: string
   activeFlags: ReconstructedActiveFlags
 } {
-  let code = ''
+  let code = initialCode
   let activeFlags: ReconstructedActiveFlags = { focused: true, connected: true }
   let snapshotIndex = -1
 

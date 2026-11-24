@@ -1,16 +1,21 @@
 import { describe, expect, it } from 'vitest'
-import { reconstructTimeline } from './timeline'
+import { projectTimelinePoints, reconstructTimeline } from './timeline'
 import type { CodeDelta, SnapshotTimelinePoint, TimelinePoint } from './timeline'
-import type { TelemetryEvent } from './telemetry'
+import type { CodeSnapshot, SnapshotTrigger, TelemetryEvent } from './telemetry'
 
-function snapshot(seq: number, code: string, timestamp = seq * 1_000): SnapshotTimelinePoint {
+function snapshot(
+  seq: number,
+  code: string,
+  timestamp = seq * 1_000,
+  trigger: SnapshotTrigger = 'periodic',
+): SnapshotTimelinePoint {
   return {
     kind: 'snapshot',
     snapshotId: `snapshot-${seq}`,
     sessionId: 'session-a',
     seq,
     clientTimestamp: timestamp,
-    trigger: 'periodic',
+    trigger,
     code,
   }
 }
@@ -82,6 +87,40 @@ function telemetry(
 }
 
 describe('timeline reconstruction', () => {
+  it('returns an empty state for empty input and preserves the initial code before the first snapshot', () => {
+    expect(reconstructTimeline({ points: [], cursor: { by: 'seq', value: 0 } })).toMatchObject({
+      sessionId: '',
+      code: '',
+      seq: null,
+      activeFlags: { focused: true, connected: true },
+      nearbyEvents: [],
+    })
+
+    const state = reconstructTimeline({
+      points: [snapshot(2, 'checkpoint')],
+      initialCode: 'starter',
+      cursor: { by: 'seq', value: 1 },
+    })
+    expect(state).toMatchObject({ sessionId: 'session-a', code: 'starter', seq: null })
+
+    expect(
+      reconstructTimeline({
+        points: [snapshot(2, 'checkpoint')],
+        initialCode: 'starter',
+        cursor: { by: 'timestamp', value: 1_000 },
+      }),
+    ).toMatchObject({ code: 'starter', seq: null, timestamp: 1_000 })
+  })
+
+  it('applies edits before any snapshot from the supplied initial code', () => {
+    const state = reconstructTimeline({
+      points: [delta(1, 3, 0, 'd')],
+      initialCode: 'abc',
+      cursor: { by: 'seq', value: 1 },
+    })
+    expect(state.code).toBe('abcd')
+  })
+
   it('starts from the nearest snapshot and applies CODE_EDIT patches by their shared sequence', () => {
     const points: TimelinePoint[] = [
       snapshot(1, 'old code'),
@@ -100,6 +139,48 @@ describe('timeline reconstruction', () => {
     expect(reconstructTimeline({ points, cursor: { by: 'seq', value: 5 } }).code).toBe(
       'hello timeline!',
     )
+  })
+
+  it('orders unsorted points and treats every snapshot trigger as a full checkpoint', () => {
+    const unsorted = [delta(2, 3, 0, 'd'), snapshot(1, 'abc')]
+    expect(reconstructTimeline({ points: unsorted, cursor: { by: 'seq', value: 2 } }).code).toBe(
+      'abcd',
+    )
+
+    const triggers: SnapshotTrigger[] = ['periodic', 'test_run', 'final_submit']
+    for (const trigger of triggers) {
+      expect(
+        reconstructTimeline({
+          points: [snapshot(1, trigger, 1_000, trigger)],
+          cursor: { by: 'seq', value: 1 },
+        }).code,
+      ).toBe(trigger)
+    }
+  })
+
+  it('projects persisted telemetry and snapshot rows into one ordered timeline', () => {
+    const event: TelemetryEvent = {
+      sessionId: 'session-a',
+      seq: 3,
+      clientTimestamp: 3_000,
+      type: 'FOCUS_RESTORED',
+      payload: { visibility: 'visible' },
+    }
+    const persistedSnapshot: CodeSnapshot = {
+      snapshotId: 'session-a:snap:2',
+      sessionId: 'session-a',
+      seq: 2,
+      clientTimestamp: 2_000,
+      serverReceivedAt: 2_100,
+      trigger: 'test_run',
+      code: 'tested',
+      suiteId: 'examples',
+    }
+
+    expect(projectTimelinePoints([event], [persistedSnapshot])).toMatchObject([
+      { kind: 'snapshot', seq: 2, trigger: 'test_run', suiteId: 'examples' },
+      { kind: 'telemetry', seq: 3, type: 'FOCUS_RESTORED' },
+    ])
   })
 
   it('scrubs by client timestamp and reconstructs active focus and connection flags', () => {

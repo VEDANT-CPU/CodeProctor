@@ -13,7 +13,11 @@ import { SNAPSHOT_INTERVAL_MS } from '../../domain/timeline'
 import type { CodeEditPayload, TestRunPayload } from '../../domain/telemetry'
 import { useActorContext } from '../../hooks/useActorContext'
 import { callWorkerAction, getActionErrorMessage } from '../../lib/action-client'
-import type { SessionTelemetryCollector } from '../../lib/session-telemetry'
+import {
+  FocusTransitionTracker,
+  type FocusTelemetryTransition,
+  type SessionTelemetryCollector,
+} from '../../lib/session-telemetry'
 import { Badge, Button, buttonVariants, ConfirmModal, Label, Textarea } from '../ui'
 
 interface SessionWorkspaceProps {
@@ -177,30 +181,26 @@ export function SessionWorkspace({ collector, onTestRunCompleted }: SessionWorks
       )
     }
 
-    let focused = true
-    const handleFocusLost = (trigger: 'blur' | 'visibilitychange') => {
-      if (document.visibilityState === 'visible' && trigger === 'visibilitychange') return
-      if (!focused) return
-      focused = false
-      report(
-        collector.recordTelemetry('FOCUS_LOST', {
-          visibility: document.visibilityState === 'hidden' ? 'hidden' : 'visible',
-          trigger,
-        }),
-      )
+    const focusTracker = new FocusTransitionTracker()
+    const recordFocusTransition = (transition: FocusTelemetryTransition | null) => {
+      if (!transition) return
+      if (transition.type === 'FOCUS_LOST') {
+        report(collector.recordTelemetry('FOCUS_LOST', transition.payload))
+      } else {
+        report(collector.recordTelemetry('FOCUS_RESTORED', transition.payload))
+      }
     }
 
-    const handleFocusRestored = () => {
-      if (focused || document.visibilityState !== 'visible') return
-      focused = true
-      report(collector.recordTelemetry('FOCUS_RESTORED', { visibility: 'visible' }))
-    }
-
-    const handleBlur = () => handleFocusLost('blur')
-    const handleFocus = () => handleFocusRestored()
+    const handleBlur = () => recordFocusTransition(
+      focusTracker.onBlur(document.visibilityState === 'hidden' ? 'hidden' : 'visible'),
+    )
+    const handleFocus = () => recordFocusTransition(
+      focusTracker.onFocus(document.visibilityState === 'hidden' ? 'hidden' : 'visible'),
+    )
     const handleVisibilityChange = () => {
-      if (document.visibilityState === 'hidden') handleFocusLost('visibilitychange')
-      else handleFocusRestored()
+      recordFocusTransition(
+        focusTracker.onVisibilityChange(document.visibilityState === 'hidden' ? 'hidden' : 'visible'),
+      )
     }
 
     if (navigator.onLine) {
@@ -208,7 +208,9 @@ export function SessionWorkspace({ collector, onTestRunCompleted }: SessionWorks
     } else {
       handleOffline()
     }
-    if (document.visibilityState === 'hidden') handleFocusLost('visibilitychange')
+    if (document.visibilityState === 'hidden') {
+      recordFocusTransition(focusTracker.onVisibilityChange('hidden'))
+    }
     window.addEventListener('offline', handleOffline)
     window.addEventListener('online', handleOnline)
     window.addEventListener('blur', handleBlur)

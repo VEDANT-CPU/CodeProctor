@@ -211,7 +211,6 @@ function aggregateSessionIncidents(
       case 'FOCUS_LOST':
         if (focused) {
           focused = false
-          hiddenEvent = event.payload.visibility === 'hidden' ? event : undefined
           focusWindow.push(event)
           addFocusClusterIfReady(
             sessionId,
@@ -221,6 +220,11 @@ function aggregateSessionIncidents(
             incidents,
             focusIncidentState,
           )
+        }
+        if (event.payload.visibility === 'hidden' && !hiddenEvent) {
+          hiddenEvent = event
+        } else if (event.payload.visibility === 'visible') {
+          hiddenEvent = undefined
         }
         break
 

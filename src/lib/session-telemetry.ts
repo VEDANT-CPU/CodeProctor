@@ -1,6 +1,8 @@
 import { isValidSequenceNumber } from '../domain/telemetry'
 import type {
   CodeSnapshot,
+  FocusLostPayload,
+  FocusRestoredPayload,
   SnapshotTrigger,
   TelemetryEvent,
   TelemetryEventType,
@@ -53,6 +55,52 @@ export interface RecordSnapshotInput {
   code: string
   suiteId?: string
   clientTimestamp?: number
+}
+
+export type FocusTelemetryTransition =
+  | { type: 'FOCUS_LOST'; payload: FocusLostPayload }
+  | { type: 'FOCUS_RESTORED'; payload: FocusRestoredPayload }
+
+export class FocusTransitionTracker {
+  private focused = true
+  private hidden = false
+
+  onBlur(visibility: 'visible' | 'hidden'): FocusTelemetryTransition | null {
+    if (visibility === 'hidden') return this.onVisibilityChange('hidden')
+    if (!this.focused) return null
+    this.focused = false
+    return {
+      type: 'FOCUS_LOST',
+      payload: { visibility: 'visible', trigger: 'blur' },
+    }
+  }
+
+  onFocus(visibility: 'visible' | 'hidden'): FocusTelemetryTransition | null {
+    if (visibility !== 'visible' || this.focused) return null
+    return this.restoreFocus()
+  }
+
+  onVisibilityChange(visibility: 'visible' | 'hidden'): FocusTelemetryTransition | null {
+    if (visibility === 'hidden') {
+      if (this.hidden) return null
+      this.hidden = true
+      this.focused = false
+      return {
+        type: 'FOCUS_LOST',
+        payload: { visibility: 'hidden', trigger: 'visibilitychange' },
+      }
+    }
+
+    this.hidden = false
+    if (this.focused) return null
+    return this.restoreFocus()
+  }
+
+  private restoreFocus(): FocusTelemetryTransition {
+    this.focused = true
+    this.hidden = false
+    return { type: 'FOCUS_RESTORED', payload: { visibility: 'visible' } }
+  }
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -155,6 +203,7 @@ export class SessionTelemetryCollector {
   private retryAttempt = 0
   private errorHandler?: (error: unknown) => void
   private statusHandler?: (pendingCount: number) => void
+  private hasStoredState: boolean
 
   constructor(
     readonly sessionId: string,
@@ -167,6 +216,7 @@ export class SessionTelemetryCollector {
     this.errorHandler = options.onError
     this.storageKey = `codeproctor:telemetry:${encodeURIComponent(sessionId)}`
     const stored = this.storage.read(this.storageKey)
+    this.hasStoredState = stored !== null
     if (stored) {
       const state = parseStoredState(stored, sessionId)
       this.nextSeq = state.nextSeq
@@ -186,6 +236,20 @@ export class SessionTelemetryCollector {
 
   get connectionState(): boolean | null {
     return this.pendingConnections[this.pendingConnections.length - 1] ?? this.lastConnectionState
+  }
+
+  get hasPersistedSequenceState(): boolean {
+    return this.hasStoredState
+  }
+
+  seedNextSequence(nextSeq: number): void {
+    if (!isValidSequenceNumber(nextSeq)) {
+      throw new Error('Server returned an invalid telemetry sequence')
+    }
+    if (nextSeq <= this.nextSeq) return
+    this.nextSeq = nextSeq
+    this.hasStoredState = true
+    this.persist()
   }
 
   setErrorHandler(handler: ((error: unknown) => void) | undefined): void {
@@ -293,7 +357,10 @@ export class SessionTelemetryCollector {
         const firstItem = this.pendingItems[0]
         if (!firstItem) break
         if (firstItem.kind === 'snapshot') {
-          await this.options.callAction('record_code_snapshot', { ...firstItem.value })
+          await this.options.callAction('record_code_snapshot', {
+            ...firstItem.value,
+            isOfflineFlush: firstItem.buffered,
+          })
           this.pendingItems.shift()
           sentCount += 1
           this.persist()
@@ -355,6 +422,7 @@ export class SessionTelemetryCollector {
       lastConnectionState: this.lastConnectionState,
     }
     this.storage.write(this.storageKey, JSON.stringify(state))
+    this.hasStoredState = true
     this.statusHandler?.(this.pendingCount)
   }
 }

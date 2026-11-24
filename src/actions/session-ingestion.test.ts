@@ -1,11 +1,16 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ActionContext, ActionTools } from 'deepspace/worker'
 import type { Env } from '../../worker'
 import type { AssessmentSession, ProblemPrompt } from '../domain/session'
 import type { ActorContext } from '../domain/types'
+import { aggregateIntegrityIncidents } from '../domain/incidents'
+import { projectTimelinePoints, reconstructTimeline } from '../domain/timeline'
+import type { CodeSnapshot, TelemetryEvent } from '../domain/telemetry'
 import { resolveActorContext } from '../server/actor-context'
 import {
   ingestTelemetryBatch,
+  getSessionTimelineData,
+  getSessionTimelineSequence,
   recordCodeSnapshot,
   updateSessionConnection,
 } from './assessment-sessions'
@@ -83,7 +88,39 @@ function makeTools(initialSession = session()) {
           }
         : { success: false as const, error: 'Record not found' }
     }),
-    query: vi.fn(),
+    query: vi.fn(async (
+      collection: string,
+      options?: {
+        where?: Record<string, unknown>
+        orderBy?: string
+        orderDir?: 'asc' | 'desc'
+      },
+    ) => {
+      const prefix = `${collection}:`
+      const rows = [...records.entries()]
+        .filter(([key, data]) =>
+          key.startsWith(prefix) &&
+          Object.entries(options?.where ?? {}).every(([field, value]) => data[field] === value),
+        )
+        .map(([key, data]) => ({
+          recordId: key.slice(prefix.length),
+          data,
+          createdBy: 'test',
+          createdAt: '',
+          updatedAt: '',
+        }))
+      if (options?.orderBy) {
+        rows.sort((left, right) => {
+          const a = left.data[options.orderBy!]
+          const b = right.data[options.orderBy!]
+          const comparison = typeof a === 'number' && typeof b === 'number'
+            ? a - b
+            : String(a).localeCompare(String(b))
+          return options.orderDir === 'desc' ? -comparison : comparison
+        })
+      }
+      return { success: true as const, data: { records: rows, count: rows.length } }
+    }),
     remove: vi.fn(),
     deleteWhere: vi.fn(),
     integration: vi.fn(),
@@ -118,11 +155,17 @@ const snapshot = {
 }
 
 beforeEach(() => {
+  vi.useFakeTimers()
+  vi.setSystemTime(1_800_000_000_000)
   vi.mocked(resolveActorContext).mockImplementation(async (userId) =>
     userId
       ? { ok: true, actor: candidateActor(userId) }
       : { ok: false, status: 401 },
   )
+})
+
+afterEach(() => {
+  vi.useRealTimers()
 })
 
 describe('session telemetry and snapshot ingestion', () => {
@@ -175,6 +218,214 @@ describe('session telemetry and snapshot ingestion', () => {
     await expect(
       recordCodeSnapshot(actionContext({ ...snapshot, seq: focusEvent.seq }, tools)),
     ).resolves.toMatchObject({ success: false, code: 'sequence_conflict' })
+  })
+
+  it('rejects skewed online timestamps and out-of-order batch times without partial writes', async () => {
+    const { tools, records } = makeTools()
+    const stale = { ...focusEvent, clientTimestamp: 1_800_000_000_000 - 6 * 60_000 }
+    await expect(
+      ingestTelemetryBatch(actionContext({ sessionId: 'session-1', events: [stale] }, tools)),
+    ).resolves.toMatchObject({ success: false, code: 'invalid_timestamp' })
+
+    await expect(
+      ingestTelemetryBatch(
+        actionContext(
+          {
+            sessionId: 'session-1',
+            events: [
+              focusEvent,
+              { ...focusEvent, seq: 2, clientTimestamp: focusEvent.clientTimestamp - 1 },
+            ],
+          },
+          tools,
+        ),
+      ),
+    ).resolves.toMatchObject({ success: false, code: 'invalid_timestamp' })
+    expect(records.has('telemetry-events:session-1:1')).toBe(false)
+    expect(records.has('telemetry-events:session-1:2')).toBe(false)
+  })
+
+  it('accepts old client timestamps on an offline flush while rejecting excessive future skew', async () => {
+    const sessionStart = 1_800_000_000_000 - 2 * 60 * 60_000
+    const { tools, records } = makeTools(session({ createdAt: sessionStart }))
+    const oldOfflineEvent = {
+      ...focusEvent,
+      clientTimestamp: 1_800_000_000_000 - 60 * 60_000,
+    }
+
+    await expect(
+      ingestTelemetryBatch(
+        actionContext(
+          { sessionId: 'session-1', events: [oldOfflineEvent], isOfflineFlush: true },
+          tools,
+        ),
+      ),
+    ).resolves.toMatchObject({ success: true, data: { acceptedCount: 1 } })
+    expect(records.get('telemetry-events:session-1:1')).toMatchObject({
+      clientTimestamp: oldOfflineEvent.clientTimestamp,
+      serverReceivedAt: 1_800_000_000_000,
+    })
+
+    const snapshotTools = makeTools(session({ createdAt: sessionStart })).tools
+    await expect(
+      recordCodeSnapshot(
+        actionContext(
+          {
+            ...snapshot,
+            clientTimestamp: 1_800_000_000_000 - 60 * 60_000,
+            isOfflineFlush: true,
+          },
+          snapshotTools,
+        ),
+      ),
+    ).resolves.toMatchObject({ success: true, data: { seq: 2 } })
+
+    await expect(
+      recordCodeSnapshot(
+        actionContext(
+          {
+            ...snapshot,
+            seq: 2,
+            clientTimestamp: 1_800_000_000_000 + 6 * 60_000,
+            isOfflineFlush: true,
+          },
+          tools,
+        ),
+      ),
+    ).resolves.toMatchObject({ success: false, code: 'invalid_timestamp' })
+
+    await expect(
+      recordCodeSnapshot(
+        actionContext(
+          {
+            ...snapshot,
+            clientTimestamp: 1_800_000_000_000 - 6 * 60_000,
+          },
+          makeTools().tools,
+        ),
+      ),
+    ).resolves.toMatchObject({ success: false, code: 'invalid_timestamp' })
+  })
+
+  it('returns all session timeline rows and the next sequence to an authorized actor', async () => {
+    const emptyTools = makeTools().tools
+    await expect(
+      getSessionTimelineSequence(actionContext({ sessionId: 'session-1' }, emptyTools)),
+    ).resolves.toMatchObject({ success: true, data: { nextSeq: 1 } })
+
+    const { tools } = makeTools()
+    await ingestTelemetryBatch(actionContext({ sessionId: 'session-1', events: [focusEvent] }, tools))
+    await recordCodeSnapshot(actionContext(snapshot, tools))
+
+    await expect(
+      getSessionTimelineSequence(actionContext({ sessionId: 'session-1' }, tools)),
+    ).resolves.toMatchObject({
+      success: true,
+      data: { sessionId: 'session-1', nextSeq: 3 },
+    })
+    await expect(
+      getSessionTimelineData(actionContext({ sessionId: 'session-1' }, tools)),
+    ).resolves.toMatchObject({
+      success: true,
+      data: {
+        sessionId: 'session-1',
+        nextSeq: 3,
+        telemetryEvents: [{ seq: 1, candidateId: 'candidate-1' }],
+        codeSnapshots: [{ seq: 2, candidateId: 'candidate-1' }],
+      },
+    })
+
+    vi.mocked(resolveActorContext).mockResolvedValue({
+      ok: true,
+      actor: candidateActor('candidate-2', 'session-1'),
+    })
+    await expect(
+      getSessionTimelineData(actionContext({ sessionId: 'session-1' }, tools, 'candidate-2')),
+    ).resolves.toMatchObject({ success: false, code: 'forbidden' })
+    await expect(
+      getSessionTimelineSequence(
+        actionContext({ sessionId: 'session-1' }, tools, 'candidate-2'),
+      ),
+    ).resolves.toMatchObject({ success: false, code: 'forbidden' })
+  })
+
+  it('orders out-of-order retry batches idempotently and reconstructs the persisted timeline', async () => {
+    const { tools } = makeTools()
+    const starterCode = problem.starterCode
+    const codeEdit = {
+    sessionId: 'session-1',
+    seq: 2,
+    clientTimestamp: 1_800_000_000_300,
+    type: 'CODE_EDIT',
+    payload: {
+      start: starterCode.length,
+      deleteCount: 0,
+      insertText: '\n// candidate edit',
+    },
+    }
+    const outOfOrderEvents = [codeEdit, focusEvent, focusEvent]
+
+    await expect(
+    ingestTelemetryBatch(
+      actionContext({ sessionId: 'session-1', events: outOfOrderEvents }, tools),
+    ),
+    ).resolves.toMatchObject({
+    success: true,
+    data: { acceptedCount: 2, duplicateCount: 1 },
+    })
+    await expect(
+    ingestTelemetryBatch(
+      actionContext(
+        { sessionId: 'session-1', events: [focusEvent, codeEdit] },
+        tools,
+      ),
+    ),
+    ).resolves.toMatchObject({
+    success: true,
+    data: { acceptedCount: 0, duplicateCount: 2 },
+    })
+    await recordCodeSnapshot(
+    actionContext(
+      {
+        ...snapshot,
+        seq: 3,
+        clientTimestamp: 1_800_000_000_400,
+        trigger: 'final_submit',
+        code: 'final code checkpoint',
+      },
+      tools,
+    ),
+    )
+
+    const result = await getSessionTimelineData(
+    actionContext({ sessionId: 'session-1' }, tools),
+    )
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    const timelineData = result.data as {
+    telemetryEvents: TelemetryEvent[]
+    codeSnapshots: CodeSnapshot[]
+    }
+
+    const points = projectTimelinePoints(timelineData.telemetryEvents, timelineData.codeSnapshots)
+    const incidents = aggregateIntegrityIncidents(timelineData.telemetryEvents)
+    expect(points.map((point) => point.seq)).toEqual([1, 2, 3])
+    expect(incidents).toEqual([])
+    expect(
+    reconstructTimeline({
+      points,
+      incidents,
+      initialCode: starterCode,
+      cursor: { by: 'seq', value: 2 },
+    }).code,
+    ).toBe(`${starterCode}\n// candidate edit`)
+    expect(
+    reconstructTimeline({
+      points,
+      initialCode: starterCode,
+      cursor: { by: 'seq', value: 3 },
+    }).code,
+    ).toBe('final code checkpoint')
   })
 
   it.each([0, -1, 1.5])('rejects invalid telemetry sequence %s', async (seq) => {

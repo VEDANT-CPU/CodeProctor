@@ -62,6 +62,10 @@ function codeEdit(
 }
 
 describe('deterministic integrity incidents', () => {
+  it('returns no incidents for empty telemetry', () => {
+    expect(aggregateIntegrityIncidents([])).toEqual([])
+  })
+
   it('links a large paste to the hidden-tab and restoration events', () => {
     const hidden = focusLost(1, 1_000)
     const restored = focusRestored(2, 17_000)
@@ -115,6 +119,33 @@ describe('deterministic integrity incidents', () => {
     expect(aggregateIntegrityIncidents(latePaste)).toEqual([])
   })
 
+  it('accepts a paste exactly at the maximum delay boundary', () => {
+    const incidents = aggregateIntegrityIncidents([
+      focusLost(1, 0),
+      focusRestored(2, 15_001),
+      largePaste(3, 25_001, 121),
+    ])
+    expect(incidents).toMatchObject([{ kind: 'PASTE_AFTER_TAB_ABSENCE', metrics: { pasteDelayMs: 10_000 } }])
+  })
+
+  it('uses a hidden visibility transition that follows an earlier visible blur', () => {
+    const incidents = aggregateIntegrityIncidents([
+      focusLost(1, 0, 'visible'),
+      focusLost(2, 500, 'hidden'),
+      focusRestored(3, 16_000),
+      largePaste(4, 16_001, 121),
+    ])
+
+    expect(incidents).toMatchObject([
+      {
+        kind: 'PASTE_AFTER_TAB_ABSENCE',
+        startSeq: 2,
+        endSeq: 4,
+        metrics: { absenceDurationMs: 15_500, pasteDelayMs: 1 },
+      },
+    ])
+  })
+
   it('emits one focus cluster for four actual transitions and ignores duplicate blur', () => {
     const events = [
       focusLost(1, 0),
@@ -132,6 +163,26 @@ describe('deterministic integrity incidents', () => {
         metrics: { transitionCount: 4, minimumTransitions: 4, windowMs: 20_000 },
       },
     ])
+  })
+
+  it('includes the exact rolling focus-window boundary but excludes a transition just outside it', () => {
+    const atBoundary = [
+      focusLost(1, 0),
+      focusRestored(2, 5_000),
+      focusLost(3, 10_000),
+      focusRestored(4, 20_000),
+    ]
+    const outsideBoundary = [
+      focusLost(1, 0),
+      focusRestored(2, 5_000),
+      focusLost(3, 10_000),
+      focusRestored(4, 20_001),
+    ]
+
+    expect(aggregateIntegrityIncidents(atBoundary)).toMatchObject([
+      { kind: 'FOCUS_FLICKER_CLUSTER', metrics: { transitionCount: 4 } },
+    ])
+    expect(aggregateIntegrityIncidents(outsideBoundary)).toEqual([])
   })
 
   it('flags a large code insertion after a code-edit idle gap', () => {

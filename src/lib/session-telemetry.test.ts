@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { TelemetryQueueStorage } from './session-telemetry'
-import { SessionTelemetryCollector } from './session-telemetry'
+import { FocusTransitionTracker, SessionTelemetryCollector } from './session-telemetry'
 
 function memoryStorage(): TelemetryQueueStorage {
   const values = new Map<string, string>()
@@ -24,6 +24,24 @@ function collectorOptions(
 }
 
 describe('SessionTelemetryCollector', () => {
+  it('records hidden visibility after a visible blur and restores once', () => {
+    const tracker = new FocusTransitionTracker()
+
+    expect(tracker.onBlur('visible')).toMatchObject({
+      type: 'FOCUS_LOST',
+      payload: { visibility: 'visible', trigger: 'blur' },
+    })
+    expect(tracker.onVisibilityChange('hidden')).toMatchObject({
+      type: 'FOCUS_LOST',
+      payload: { visibility: 'hidden', trigger: 'visibilitychange' },
+    })
+    expect(tracker.onFocus('hidden')).toBeNull()
+    expect(tracker.onVisibilityChange('visible')).toMatchObject({
+      type: 'FOCUS_RESTORED',
+    })
+    expect(tracker.onFocus('visible')).toBeNull()
+  })
+
   it('uses one increasing sequence across events and snapshots', async () => {
     const calls: Array<{ name: string; params: Record<string, unknown> }> = []
     const collector = new SessionTelemetryCollector('session-a', collectorOptions(
@@ -53,7 +71,7 @@ describe('SessionTelemetryCollector', () => {
     ])
   })
 
-  it('buffers mixed items offline and flushes each type in ascending sequence order', async () => {
+  it('replays mixed offline telemetry and snapshots in order and restores connection state', async () => {
     let online = false
     const calls: Array<{ name: string; params: Record<string, unknown> }> = []
     const collector = new SessionTelemetryCollector(
@@ -70,23 +88,55 @@ describe('SessionTelemetryCollector', () => {
     })
     await collector.recordSnapshot({ trigger: 'periodic', code: 'offline code' })
     await collector.recordTelemetry('FOCUS_RESTORED', { visibility: 'visible' })
-    expect(collector.pendingCount).toBe(3)
+    await collector.setConnection(false)
+    expect(collector.pendingCount).toBe(4)
 
     online = true
-    await collector.flush()
+    await collector.setConnection(true)
+    await collector.recordTelemetry('CONNECTION_RECOVERED', {
+      disconnectDurationMs: 1_000,
+      flushedEventCount: 2,
+    })
 
     expect(calls.map(({ name }) => name)).toEqual([
+      'update_session_connection',
+      'update_session_connection',
       'ingest_telemetry_batch',
       'record_code_snapshot',
       'ingest_telemetry_batch',
+      'ingest_telemetry_batch',
     ])
-    expect(calls.map(({ params }) =>
+    expect(calls.slice(2).map(({ params }) =>
       'events' in params
         ? (params.events as Array<{ seq: number }>)[0]?.seq
         : params.seq,
-    )).toEqual([1, 2, 3])
-    expect(calls[0].params.isOfflineFlush).toBe(true)
+    )).toEqual([1, 2, 3, 4])
+    expect(calls.slice(0, 2).map(({ params }) => params.connected)).toEqual([false, true])
+    expect(calls[2].params.isOfflineFlush).toBe(true)
+    expect(calls[3].params.isOfflineFlush).toBe(true)
+    expect(calls[4].params.isOfflineFlush).toBe(true)
+    expect(calls[5].params.isOfflineFlush).toBe(false)
     expect(collector.pendingCount).toBe(0)
+    expect(collector.connectionState).toBe(true)
+  })
+
+  it('seeds a new collector from the server high-water mark without reassigning queued items', async () => {
+    const collector = new SessionTelemetryCollector(
+      'session-server-seed',
+      collectorOptions(async () => ({ success: true }), () => true),
+    )
+    collector.seedNextSequence(12)
+    const first = await collector.recordTelemetry('FOCUS_LOST', {
+      visibility: 'hidden',
+      trigger: 'visibilitychange',
+    })
+
+    expect(first.seq).toBe(12)
+    expect(collector.hasPersistedSequenceState).toBe(true)
+    expect(() => collector.seedNextSequence(2)).not.toThrow()
+    const next = await collector.recordSnapshot({ trigger: 'periodic', code: 'code' })
+    expect(next.seq).toBe(13)
+    collector.dispose()
   })
 
   it('restores the next sequence from session storage after collector recreation', async () => {
