@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import { Link } from 'react-router-dom'
-import type { AssessmentSession } from '../../domain/session'
+import { getEffectiveSessionStatus, type AssessmentSession } from '../../domain/session'
 import { callWorkerAction, getActionErrorMessage } from '../../lib/action-client'
 import { Badge, Button, Input, Label, buttonVariants } from '../ui'
 
@@ -21,6 +21,8 @@ function SessionStatus({ status }: { status: AssessmentSession['status'] }) {
 }
 
 function SessionSummary({ session }: { session: AssessmentSession }) {
+  const effectiveStatus = getEffectiveSessionStatus(session)
+
   return (
     <section className="space-y-4 rounded-xl border border-border bg-card p-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -28,7 +30,7 @@ function SessionSummary({ session }: { session: AssessmentSession }) {
           <h2 className="text-lg font-semibold">{session.problem.title}</h2>
           <p className="mt-1 text-sm text-muted-foreground">Session ID: {session.id}</p>
         </div>
-        <SessionStatus status={session.status} />
+        <SessionStatus status={effectiveStatus} />
       </div>
       <dl className="grid gap-3 text-sm sm:grid-cols-2">
         <div>
@@ -40,10 +42,10 @@ function SessionSummary({ session }: { session: AssessmentSession }) {
           <dd>{formatTime(session.startedAt)}</dd>
         </div>
       </dl>
-      {session.status === 'pending' && (
+      {effectiveStatus === 'pending' && (
         <p className="text-sm text-muted-foreground">Waiting for the proctor to activate this session.</p>
       )}
-      {session.status === 'active' ? (
+      {effectiveStatus === 'active' ? (
         <Link
           className={buttonVariants()}
           to={`/sessions/${encodeURIComponent(session.id)}`}
@@ -52,9 +54,9 @@ function SessionSummary({ session }: { session: AssessmentSession }) {
         </Link>
       ) : (
         <p className="text-sm text-muted-foreground">
-          {session.status === 'submitted'
+          {effectiveStatus === 'submitted'
             ? 'This assessment has been submitted.'
-            : session.status === 'timed_out'
+            : effectiveStatus === 'timed_out'
               ? 'This assessment has timed out.'
               : 'The workspace will be available after activation.'}
         </p>

@@ -8,7 +8,7 @@ import {
   isTerminalSessionStatus,
 } from '../../domain/guards'
 import { runCuratedTestSuite, type CuratedTestSuiteResult } from '../../domain/test-runner'
-import { toSessionContext, type AssessmentSession } from '../../domain/session'
+import { getEffectiveSessionStatus, toSessionContext, type AssessmentSession } from '../../domain/session'
 import { SNAPSHOT_INTERVAL_MS } from '../../domain/timeline'
 import type { CodeEditPayload, TestRunPayload } from '../../domain/telemetry'
 import { useActorContext } from '../../hooks/useActorContext'
@@ -105,7 +105,21 @@ export function SessionWorkspace({ collector, onTestRunCompleted }: SessionWorks
     setTestRun(null)
   }, [loadedSessionId, starterCode, firstSuiteId])
 
-  const sessionContext = session ? toSessionContext(session) : null
+  const [now, setNow] = useState(() => Date.now())
+
+  useEffect(() => {
+    if (!session || (session.status !== 'pending' && session.status !== 'active')) return
+    if (now >= session.expiresAt) return
+    const timer = window.setInterval(() => {
+      setNow(Date.now())
+    }, 1000)
+    return () => window.clearInterval(timer)
+  }, [session, now])
+
+  const effectiveStatus = session ? getEffectiveSessionStatus(session, now) : null
+  const sessionContext = session && effectiveStatus
+    ? { ...toSessionContext(session), status: effectiveStatus }
+    : null
   const canAccess = Boolean(
     actor && sessionContext && canAccessSession(actor, sessionContext),
   )
@@ -135,6 +149,16 @@ export function SessionWorkspace({ collector, onTestRunCompleted }: SessionWorks
 
   useEffect(() => {
     collector.setErrorHandler((collectorError) => {
+      if (
+        collectorError &&
+        typeof collectorError === 'object' &&
+        'code' in collectorError &&
+        collectorError.code === 'session_timed_out'
+      ) {
+        setSession((prev) => (prev ? { ...prev, status: 'timed_out', isConnected: false } : prev))
+        setActionError('This session has timed out.')
+        return
+      }
       setActionError(getActionErrorMessage(collectorError))
     })
     collector.setStatusHandler(setPendingTelemetryCount)
@@ -301,8 +325,19 @@ export function SessionWorkspace({ collector, onTestRunCompleted }: SessionWorks
       setSession(submittedSession)
       setConfirmSubmit(false)
     } catch (submitError) {
+      if (
+        submitError &&
+        typeof submitError === 'object' &&
+        'code' in submitError &&
+        submitError.code === 'session_timed_out'
+      ) {
+        setSession((prev) => (prev ? { ...prev, status: 'timed_out', isConnected: false } : prev))
+        setConfirmSubmit(false)
+        setActionError('This session has timed out.')
+        return
+      }
       setActionError(getActionErrorMessage(submitError))
-      if (navigator.onLine && session.status === 'active') {
+      if (navigator.onLine && effectiveStatus === 'active') {
         void collector.setConnection(true).catch((connectionError: unknown) => {
           setActionError(getActionErrorMessage(connectionError))
         })
@@ -328,15 +363,23 @@ export function SessionWorkspace({ collector, onTestRunCompleted }: SessionWorks
               <h1 className="text-2xl font-semibold">{session.problem.title}</h1>
               <p className="mt-1 break-all text-sm text-muted-foreground">Session {session.id}</p>
             </div>
-            <Badge variant={session.status === 'active' ? 'success' : 'secondary'}>
-              {session.status.replace('_', ' ')}
+            <Badge
+              variant={
+                effectiveStatus === 'active'
+                  ? 'success'
+                  : effectiveStatus === 'timed_out'
+                    ? 'destructive'
+                    : 'secondary'
+              }
+            >
+              {(effectiveStatus ?? session.status).replace('_', ' ')}
             </Badge>
           </header>
-          {isCandidate && session.status !== 'active' ? (
+          {isCandidate && effectiveStatus !== 'active' ? (
             <p role="status" className="rounded-lg border border-border bg-card p-4 text-sm text-muted-foreground">
-              {session.status === 'pending'
+              {effectiveStatus === 'pending'
                 ? 'This session is waiting for proctor activation.'
-                : session.status === 'submitted'
+                : effectiveStatus === 'submitted'
                   ? `This session was submitted${session.submittedAt ? ` at ${new Date(session.submittedAt).toLocaleString()}` : ''}.`
                   : 'This session has timed out.'}
             </p>

@@ -24,6 +24,7 @@ const ALLOWED_TOOL_NAMES = [
   'records.update',
   'records.delete',
   'user.current',
+  'ai_brief.request',
 ]
 
 // ============================================================================
@@ -68,6 +69,22 @@ export function buildSystemPrompt(appName: string, schemas: CollectionSchema[]):
     'Use tools to look up facts before answering. Do not invent data.',
     'If data is missing, say so plainly. Keep answers concise.',
     '',
+    '## AI Incident Briefs (Proctors only)',
+    'Use the `ai_brief_request` tool to generate an AiIncidentBrief for a session window.',
+    'The brief contains:',
+    '  - `summary`: concise text grounded only in browser-level telemetry signals',
+    '  - `citations`: an array of IncidentCitation references, each of which has:',
+    '      - `source`: one of "telemetry_event" | "snapshot" | "code_diff"',
+    '      - `sessionId`, `seq`, `timestamp`: exact (session, sequence, epoch-ms) position',
+    '      - for telemetry_event: `eventType` (e.g. "FOCUS_LOST", "LARGE_PASTE")',
+    '      - for snapshot: `snapshotId`',
+    '  - `startSeq` / `endSeq` / `startTimestamp` / `endTimestamp`: the window reviewed',
+    '  - `incidentKind` (optional): the deterministic rule kind (e.g. "PASTE_AFTER_TAB_ABSENCE")',
+    'When presenting a brief, always render citations with their seq and timestamp so the',
+    'proctor can jump directly to the evidence in the timeline inspector.',
+    'Only cite records from the target sessionId within the requested window.',
+    'Never claim these signals are proof of misconduct — they are browser-level triage aids.',
+    '',
     'Available collections:',
     schemaSummary || '(none)',
   ].join('\n')
@@ -93,6 +110,60 @@ export function buildTools(executor: ToolExecutor): ToolSet {
         executor(def.name, applyAiToolDefaults(def.name, params)),
     })
   }
+
+  // Register the AI incident brief action as a first-class tool so the
+  // in-app assistant and local agent can invoke `request_ai_overview` through
+  // the same executor pathway that all other actions use.  The name is
+  // intentionally distinct from the kebab-case action name so it does not
+  // collide with built-in tool names.
+  tools['ai_brief_request'] = tool({
+    description:
+      'Generate an AI-assisted incident brief for a session window. ' +
+      'Accepts sessionId (required), incidentId (optional — narrows to a specific deterministic incident), ' +
+      'and optional sequence/timestamp bounds (startSeq, endSeq, startTimestamp, endTimestamp). ' +
+      'Returns an AiIncidentBrief with a summary grounded in browser-level telemetry signals ' +
+      'and IncidentCitation references (telemetry_event, snapshot, code_diff) that link back to ' +
+      'exact (seq, timestamp) positions in the session timeline. ' +
+      'Only proctors may call this tool; candidates receive a forbidden error.',
+    inputSchema: jsonSchema<Record<string, unknown>>(
+      {
+        type: 'object',
+        properties: {
+          sessionId: { type: 'string', description: 'Assessment session ID to summarize.' },
+          incidentId: {
+            type: 'string',
+            description: 'Optional deterministic incident ID to focus the brief on.',
+          },
+          startSeq: { type: 'number', description: 'Inclusive start of the sequence window.' },
+          endSeq: { type: 'number', description: 'Inclusive end of the sequence window.' },
+          startTimestamp: {
+            type: 'number',
+            description: 'Inclusive start epoch-ms timestamp for the review window.',
+          },
+          endTimestamp: {
+            type: 'number',
+            description: 'Inclusive end epoch-ms timestamp for the review window.',
+          },
+        },
+        required: ['sessionId'],
+        additionalProperties: false,
+      },
+      {
+        validate: async (value) => {
+          if (
+            typeof value !== 'object' ||
+            value === null ||
+            typeof (value as Record<string, unknown>).sessionId !== 'string'
+          ) {
+            return { success: false, error: new Error('sessionId is required') }
+          }
+          return { success: true, value: value as Record<string, unknown> }
+        },
+      },
+    ),
+    execute: async (params: Record<string, unknown>) =>
+      executor('request_ai_overview', params),
+  })
 
   return tools
 }

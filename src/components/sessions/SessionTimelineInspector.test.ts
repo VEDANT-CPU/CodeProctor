@@ -2,17 +2,28 @@ import { describe, expect, it } from 'vitest'
 import type { AssessmentSession } from '../../domain/session'
 import type { TimelinePoint, CodeDelta, SnapshotTimelinePoint } from '../../domain/timeline'
 import type { TelemetryEvent, SnapshotTrigger } from '../../domain/telemetry'
+import type { ProctorAnnotation, ReviewDisposition, AiIncidentBrief, IncidentCitation } from '../../domain/review'
+import type { IntegrityIncident } from '../../domain/incidents'
 import {
+  buildIncidentAnnotationAnchor,
+  buildTimelineAnchor,
   buildTimelineCursor,
   canStartRefreshRequest,
+  dispositionBadgeVariant,
+  findAnnotationsAtCursor,
+  formatAnnotationSummary,
+  groupAnnotationsByIncident,
   hasTimelineDataChanged,
   jumpToEvidenceSeq,
   reconcileCursorOnRefresh,
   reconstructInspectorTimeline,
+  resolveNextSessionDisposition,
   resolveTimelineBounds,
   shouldAutoRefresh,
   stepTimestamp,
   switchCursorMode,
+  buildAiBriefParams,
+  shouldShowAiBriefPanel,
   DEFAULT_LIVE_REFRESH_INTERVAL_MS,
   SEQUENCE_SCRUBBING_NOTE,
   TIMESTAMP_SCRUBBING_NOTE,
@@ -552,6 +563,367 @@ describe('SessionTimelineInspector helpers and timeline reconstruction', () => {
     it('exposes sensible default live refresh interval (~4s)', () => {
       expect(DEFAULT_LIVE_REFRESH_INTERVAL_MS).toBeGreaterThanOrEqual(4_000)
       expect(DEFAULT_LIVE_REFRESH_INTERVAL_MS).toBeLessThanOrEqual(5_000)
+    })
+  })
+
+  describe('proctor annotations and disposition helpers', () => {
+    it('maps review dispositions to appropriate badge variants', () => {
+      expect(dispositionBadgeVariant('clear')).toBe('success')
+      expect(dispositionBadgeVariant('needs_review')).toBe('warning')
+      expect(dispositionBadgeVariant('flagged')).toBe('destructive')
+      expect(dispositionBadgeVariant('unreviewed')).toBe('secondary')
+      // Fallback for unknown / arbitrary strings
+      expect(dispositionBadgeVariant('unknown' as ReviewDisposition)).toBe('secondary')
+    })
+
+    it('builds timeline anchor clamping sequence numbers to minimum 1', () => {
+      const standard = buildTimelineAnchor('session-1', 42, 12_345)
+      expect(standard).toEqual({
+        sessionId: 'session-1',
+        seq: 42,
+        timestamp: 12_345,
+      })
+
+      const rounded = buildTimelineAnchor('session-1', 7.8, 12_345)
+      expect(rounded.seq).toBe(8)
+
+      const clampedZero = buildTimelineAnchor('session-1', 0, 12_345)
+      expect(clampedZero.seq).toBe(1)
+
+      const clampedNegative = buildTimelineAnchor('session-1', -15, 12_345)
+      expect(clampedNegative.seq).toBe(1)
+    })
+
+    it('builds incident annotation anchor positioned at incident conclusion', () => {
+      const incident: IntegrityIncident = {
+        id: 'inc-1',
+        sessionId: 'session-1',
+        kind: 'PASTE_AFTER_TAB_ABSENCE',
+        startSeq: 10,
+        endSeq: 14,
+        startTimestamp: 100_000,
+        endTimestamp: 120_000,
+        evidence: [
+          { seq: 10, clientTimestamp: 100_000, eventType: 'FOCUS_LOST' },
+          { seq: 14, clientTimestamp: 120_000, eventType: 'LARGE_PASTE' },
+        ],
+        signalScope: 'browser_telemetry',
+        metrics: {
+          absenceDurationMs: 15_000,
+          pasteDelayMs: 2_000,
+          pasteCharacterCount: 200,
+          pasteLineCount: 3,
+          minimumAbsenceDurationMs: 15_000,
+          maximumPasteDelayMs: 10_000,
+          minimumPasteCharacterCount: 120,
+        },
+      }
+
+      const anchor = buildIncidentAnnotationAnchor(incident)
+      expect(anchor).toEqual({
+        sessionId: 'session-1',
+        seq: 14,
+        timestamp: 120_000,
+      })
+    })
+
+    it('filters annotations anchored to a specific cursor sequence index', () => {
+      const a1: ProctorAnnotation = {
+        id: 'ann-1',
+        sessionId: 'session-1',
+        proctorId: 'proctor-1',
+        notes: 'First note',
+        disposition: 'needs_review',
+        anchor: { sessionId: 'session-1', seq: 5, timestamp: 5_000 },
+        createdAt: 10_000,
+        updatedAt: 10_000,
+      }
+      const a2: ProctorAnnotation = {
+        id: 'ann-2',
+        sessionId: 'session-1',
+        proctorId: 'proctor-2',
+        notes: 'Second note at different seq',
+        disposition: 'flagged',
+        anchor: { sessionId: 'session-1', seq: 8, timestamp: 8_000 },
+        createdAt: 11_000,
+        updatedAt: 11_000,
+      }
+      const a3: ProctorAnnotation = {
+        id: 'ann-3',
+        sessionId: 'session-1',
+        proctorId: 'proctor-1',
+        notes: 'Unanchored session-level note',
+        disposition: 'clear',
+        createdAt: 12_000,
+        updatedAt: 12_000,
+      }
+      const a4: ProctorAnnotation = {
+        id: 'ann-4',
+        sessionId: 'session-1',
+        proctorId: 'proctor-3',
+        notes: 'Another note at seq 5',
+        disposition: 'needs_review',
+        anchor: { sessionId: 'session-1', seq: 5, timestamp: 5_500 },
+        createdAt: 13_000,
+        updatedAt: 13_000,
+      }
+
+      const atSeq5 = findAnnotationsAtCursor([a1, a2, a3, a4], 5)
+      expect(atSeq5).toEqual([a1, a4])
+
+      const atSeq8 = findAnnotationsAtCursor([a1, a2, a3, a4], 8)
+      expect(atSeq8).toEqual([a2])
+
+      const atSeq99 = findAnnotationsAtCursor([a1, a2, a3, a4], 99)
+      expect(atSeq99).toEqual([])
+    })
+
+    it('groups annotations by incident identifier', () => {
+      const a1: ProctorAnnotation = {
+        id: 'ann-1',
+        sessionId: 'session-1',
+        proctorId: 'proctor-1',
+        notes: 'Incident review note 1',
+        disposition: 'flagged',
+        incidentId: 'inc-paste-1',
+        createdAt: 10_000,
+        updatedAt: 10_000,
+      }
+      const a2: ProctorAnnotation = {
+        id: 'ann-2',
+        sessionId: 'session-1',
+        proctorId: 'proctor-2',
+        notes: 'Incident review note 2',
+        disposition: 'needs_review',
+        incidentId: 'inc-paste-1',
+        createdAt: 11_000,
+        updatedAt: 11_000,
+      }
+      const a3: ProctorAnnotation = {
+        id: 'ann-3',
+        sessionId: 'session-1',
+        proctorId: 'proctor-1',
+        notes: 'Flicker note',
+        disposition: 'clear',
+        incidentId: 'inc-flicker-2',
+        createdAt: 12_000,
+        updatedAt: 12_000,
+      }
+      const a4: ProctorAnnotation = {
+        id: 'ann-4',
+        sessionId: 'session-1',
+        proctorId: 'proctor-1',
+        notes: 'General note without incident',
+        disposition: 'unreviewed',
+        createdAt: 13_000,
+        updatedAt: 13_000,
+      }
+
+      const grouped = groupAnnotationsByIncident([a1, a2, a3, a4])
+      expect(grouped.size).toBe(2)
+      expect(grouped.get('inc-paste-1')).toEqual([a1, a2])
+      expect(grouped.get('inc-flicker-2')).toEqual([a3])
+      expect(grouped.get('inc-nonexistent')).toBeUndefined()
+    })
+
+    it('formats compact human-readable annotation summary strings', () => {
+      const full: ProctorAnnotation = {
+        id: 'ann-1',
+        sessionId: 'session-1',
+        proctorId: 'proctor-alice',
+        notes: 'Suspicious paste detected after tab switch.',
+        disposition: 'flagged',
+        incidentId: 'inc-123',
+        anchor: { sessionId: 'session-1', seq: 14, timestamp: 120_000 },
+        createdAt: 10_000,
+        updatedAt: 10_000,
+      }
+      expect(formatAnnotationSummary(full)).toBe(
+        '[flagged] proctor-alice [inc-123] @ seq 14: Suspicious paste detected after tab switch.',
+      )
+
+      const unanchored: ProctorAnnotation = {
+        id: 'ann-2',
+        sessionId: 'session-1',
+        proctorId: 'proctor-bob',
+        notes: 'Clean run overall.',
+        disposition: 'clear',
+        createdAt: 10_000,
+        updatedAt: 10_000,
+      }
+      expect(formatAnnotationSummary(unanchored)).toBe(
+        '[clear] proctor-bob: Clean run overall.',
+      )
+    })
+
+    it('resolves next session disposition transitions and change detection', () => {
+      const changed = resolveNextSessionDisposition('unreviewed', 'flagged')
+      expect(changed).toEqual({
+        disposition: 'flagged',
+        changed: true,
+      })
+
+      const unchanged = resolveNextSessionDisposition('needs_review', 'needs_review')
+      expect(unchanged).toEqual({
+        disposition: 'needs_review',
+        changed: false,
+      })
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// AI Brief helpers
+// ---------------------------------------------------------------------------
+
+describe('AI Brief helpers', () => {
+  describe('shouldShowAiBriefPanel', () => {
+    it('returns true only for proctor role', () => {
+      expect(shouldShowAiBriefPanel('proctor')).toBe(true)
+      expect(shouldShowAiBriefPanel('candidate')).toBe(false)
+      expect(shouldShowAiBriefPanel(null)).toBe(false)
+      expect(shouldShowAiBriefPanel(undefined)).toBe(false)
+    })
+
+    it('never returns true for a candidate — isolation is strict', () => {
+      // Explicit paranoia check: no input that is not exactly 'proctor' should pass.
+      const candidateInputs: Array<'proctor' | 'candidate' | null | undefined> = [
+        'candidate',
+        null,
+        undefined,
+      ]
+      for (const role of candidateInputs) {
+        expect(shouldShowAiBriefPanel(role)).toBe(false)
+      }
+    })
+  })
+
+  describe('buildAiBriefParams', () => {
+    it('always includes sessionId', () => {
+      const params = buildAiBriefParams('session-abc')
+      expect(params).toEqual({ sessionId: 'session-abc' })
+    })
+
+    it('includes only the optional fields that are explicitly provided', () => {
+      const full = buildAiBriefParams('session-xyz', {
+        startSeq: 3,
+        endSeq: 15,
+        startTimestamp: 1_000,
+        endTimestamp: 9_000,
+        incidentId: 'inc-paste-1',
+      })
+      expect(full).toEqual({
+        sessionId: 'session-xyz',
+        startSeq: 3,
+        endSeq: 15,
+        startTimestamp: 1_000,
+        endTimestamp: 9_000,
+        incidentId: 'inc-paste-1',
+      })
+    })
+
+    it('omits undefined optional fields (no spurious keys)', () => {
+      const params = buildAiBriefParams('session-abc', { startSeq: 1 })
+      expect(Object.keys(params)).toEqual(['sessionId', 'startSeq'])
+      expect('endSeq' in params).toBe(false)
+      expect('incidentId' in params).toBe(false)
+    })
+
+    it('handles empty options object identically to no options arg', () => {
+      expect(buildAiBriefParams('s')).toEqual(buildAiBriefParams('s', {}))
+    })
+  })
+
+  describe('jumpToEvidenceSeq — citation jump target behaviour', () => {
+    it('returns a seq-mode cursor at the citation seq and timestamp', () => {
+      const target = jumpToEvidenceSeq(12, 55_000)
+      expect(target.mode).toBe('seq')
+      expect(target.seq).toBe(12)
+      expect(target.timestamp).toBe(55_000)
+    })
+
+    it('defaults timestamp to 0 when not supplied', () => {
+      const target = jumpToEvidenceSeq(7)
+      expect(target.mode).toBe('seq')
+      expect(target.seq).toBe(7)
+      expect(target.timestamp).toBe(0)
+    })
+
+    it('a telemetry_event citation with seq=5 and timestamp=5000 jumps to seq 5 in seq mode', () => {
+      // Simulating what the UI does when user clicks a telemetry_event citation
+      const citation: IncidentCitation = {
+        source: 'telemetry_event',
+        sessionId: 'session-1',
+        seq: 5,
+        timestamp: 5_000,
+        eventType: 'LARGE_PASTE',
+      }
+      const jumped = jumpToEvidenceSeq(citation.seq, citation.timestamp)
+      expect(jumped.mode).toBe('seq')
+      expect(jumped.seq).toBe(5)
+      expect(jumped.timestamp).toBe(5_000)
+    })
+
+    it('a snapshot citation with seq=10 and timestamp=10000 jumps to seq 10 in seq mode', () => {
+      const citation: IncidentCitation = {
+        source: 'snapshot',
+        sessionId: 'session-1',
+        seq: 10,
+        timestamp: 10_000,
+        snapshotId: 'snap-10',
+      }
+      const jumped = jumpToEvidenceSeq(citation.seq, citation.timestamp)
+      expect(jumped.mode).toBe('seq')
+      expect(jumped.seq).toBe(10)
+    })
+
+    it('a code_diff citation jumps to its seq in seq mode', () => {
+      const citation: IncidentCitation = {
+        source: 'code_diff',
+        sessionId: 'session-1',
+        seq: 3,
+        timestamp: 3_000,
+      }
+      const jumped = jumpToEvidenceSeq(citation.seq, citation.timestamp)
+      expect(jumped.mode).toBe('seq')
+      expect(jumped.seq).toBe(3)
+    })
+  })
+
+  describe('proctor vs candidate guard — integration with shouldShowAiBriefPanel', () => {
+    it('proctor brief-panel guard is completely independent of session status', () => {
+      // The UI guard is role-only; session status does not affect it
+      // (server enforces per-status RBAC separately via authorizeActorAction)
+      const statuses = ['pending', 'active', 'submitted', 'timed_out'] as const
+      for (const _status of statuses) {
+        expect(shouldShowAiBriefPanel('proctor')).toBe(true)
+        expect(shouldShowAiBriefPanel('candidate')).toBe(false)
+      }
+    })
+
+    it('buildAiBriefParams round-trips correctly for all supported bound combinations', () => {
+      // No bounds
+      expect(buildAiBriefParams('s')).toEqual({ sessionId: 's' })
+
+      // Seq bounds only
+      expect(buildAiBriefParams('s', { startSeq: 1, endSeq: 20 })).toEqual({
+        sessionId: 's',
+        startSeq: 1,
+        endSeq: 20,
+      })
+
+      // Timestamp bounds only
+      expect(buildAiBriefParams('s', { startTimestamp: 0, endTimestamp: 100 })).toEqual({
+        sessionId: 's',
+        startTimestamp: 0,
+        endTimestamp: 100,
+      })
+
+      // incidentId only
+      expect(buildAiBriefParams('s', { incidentId: 'inc-1' })).toEqual({
+        sessionId: 's',
+        incidentId: 'inc-1',
+      })
     })
   })
 })

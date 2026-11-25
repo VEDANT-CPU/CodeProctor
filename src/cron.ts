@@ -26,10 +26,38 @@
  *   }
  */
 
-import type { CronTask } from 'deepspace/worker'
+import type { ActionTools, CronTask, QueryActionData } from 'deepspace/worker'
+import { buildCronContext } from 'deepspace/worker'
+import type { Env } from '../worker.js'
+import { sweepExpiredAssessmentSessions } from './actions/assessment-sessions.js'
 
-export const tasks: CronTask[] = []
+export const tasks: CronTask[] = [
+  { name: 'expire-assessment-sessions', intervalMinutes: 1 },
+]
 
-export async function runTask(_name: string, _env: unknown): Promise<void> {
-  // No-op — implement your cron tasks here. Dispatch on `_name`.
+export async function runTask(name: string, env: Env): Promise<void> {
+  if (name === 'expire-assessment-sessions') {
+    const ctx = buildCronContext(env, env.OWNER_USER_ID, `app:${env.DEEPSPACE_APP_ID}`)
+    const cronTools: Pick<ActionTools, 'query' | 'update'> = {
+      query: async <T extends Record<string, unknown> = Record<string, unknown>>(
+        collection: string,
+        options?: { where?: Record<string, unknown> },
+      ) => {
+        const raw = await ctx.records.query(collection, options)
+        const records = (Array.isArray(raw) ? raw : []) as QueryActionData<T>['records']
+        return {
+          success: true as const,
+          data: { records, count: records.length, total: records.length, hasMore: false },
+        }
+      },
+      update: async (collection: string, recordId: string, data: Record<string, unknown>) => {
+        await ctx.records.update(collection, recordId, data)
+        return { success: true as const, data: { recordId } }
+      },
+    }
+    const result = await sweepExpiredAssessmentSessions(cronTools)
+    if (!result.success) {
+      throw new Error(result.result.error)
+    }
+  }
 }

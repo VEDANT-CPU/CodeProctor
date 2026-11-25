@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { AiIncidentBrief, ProctorAnnotation, ReviewDisposition, TimelineAnchor } from '../../domain/review'
+import { reviewDispositions } from '../../domain/review'
 import type { AssessmentSession } from '../../domain/session'
 import { aggregateIntegrityIncidents } from '../../domain/incidents'
 import type { IntegrityIncident } from '../../domain/incidents'
@@ -25,9 +27,12 @@ export interface SessionTimelineData {
   nextSeq: number
 }
 
-interface SessionTimelineInspectorProps {
+export interface SessionTimelineInspectorProps {
   session: AssessmentSession
   onClose: () => void
+  onSessionUpdated?: (updated: AssessmentSession) => void
+  /** UI-layer actor role for conditional rendering; server enforces RBAC independently. */
+  actorRole?: 'proctor' | 'candidate' | null
 }
 
 /** Scrubbing cursor mode: monotonic sequence or client-observed timestamp. */
@@ -81,6 +86,86 @@ export function pointLabel(point: TimelinePoint): string {
 
 export function incidentMetrics(incident: IntegrityIncident): readonly [string, number][] {
   return Object.entries(incident.metrics)
+}
+
+/** Maps a review disposition to the corresponding UI Badge variant. */
+export function dispositionBadgeVariant(
+  disposition: ReviewDisposition,
+): 'success' | 'warning' | 'destructive' | 'secondary' {
+  switch (disposition) {
+    case 'clear':
+      return 'success'
+    case 'needs_review':
+      return 'warning'
+    case 'flagged':
+      return 'destructive'
+    case 'unreviewed':
+    default:
+      return 'secondary'
+  }
+}
+
+/** Constructs a valid TimelineAnchor for an assessment session. */
+export function buildTimelineAnchor(
+  sessionId: string,
+  seq: number,
+  timestamp: number,
+): TimelineAnchor {
+  return {
+    sessionId,
+    seq: Math.max(1, Math.round(seq)),
+    timestamp,
+  }
+}
+
+/** Constructs a TimelineAnchor positioned at the conclusion of a deterministic incident. */
+export function buildIncidentAnnotationAnchor(incident: IntegrityIncident): TimelineAnchor {
+  return {
+    sessionId: incident.sessionId,
+    seq: incident.endSeq,
+    timestamp: incident.endTimestamp,
+  }
+}
+
+/** Filters review annotations anchored to a specific session sequence cursor. */
+export function findAnnotationsAtCursor(
+  annotations: readonly ProctorAnnotation[],
+  cursorSeq: number,
+): ProctorAnnotation[] {
+  return annotations.filter((annotation) => annotation.anchor?.seq === cursorSeq)
+}
+
+/** Groups annotations by their referenced deterministic incident identifier. */
+export function groupAnnotationsByIncident(
+  annotations: readonly ProctorAnnotation[],
+): Map<string, ProctorAnnotation[]> {
+  const grouped = new Map<string, ProctorAnnotation[]>()
+  for (const annotation of annotations) {
+    if (annotation.incidentId) {
+      const existing = grouped.get(annotation.incidentId) ?? []
+      existing.push(annotation)
+      grouped.set(annotation.incidentId, existing)
+    }
+  }
+  return grouped
+}
+
+/** Formats a compact summary string for a proctor review annotation. */
+export function formatAnnotationSummary(annotation: ProctorAnnotation): string {
+  const anchorPart = annotation.anchor ? ` @ seq ${annotation.anchor.seq}` : ''
+  const incidentPart = annotation.incidentId ? ` [${annotation.incidentId}]` : ''
+  return `[${annotation.disposition}] ${annotation.proctorId}${incidentPart}${anchorPart}: ${annotation.notes}`
+}
+
+/** Resolves the next disposition state and determines if a transition occurred. */
+export function resolveNextSessionDisposition(
+  current: ReviewDisposition,
+  incoming: ReviewDisposition,
+): { disposition: ReviewDisposition; changed: boolean } {
+  return {
+    disposition: incoming,
+    changed: current !== incoming,
+  }
 }
 
 /** Determines whether live auto-refresh should run for a given session status, paused state, and inspector open state. */
@@ -261,9 +346,39 @@ export function reconstructInspectorTimeline(params: {
   }
 }
 
+/** Builds the params object for a request_ai_overview action call. */
+export function buildAiBriefParams(
+  sessionId: string,
+  options: {
+    startSeq?: number
+    endSeq?: number
+    startTimestamp?: number
+    endTimestamp?: number
+    incidentId?: string
+  } = {},
+): Record<string, unknown> {
+  const params: Record<string, unknown> = { sessionId }
+  if (options.startSeq !== undefined) params.startSeq = options.startSeq
+  if (options.endSeq !== undefined) params.endSeq = options.endSeq
+  if (options.startTimestamp !== undefined) params.startTimestamp = options.startTimestamp
+  if (options.endTimestamp !== undefined) params.endTimestamp = options.endTimestamp
+  if (options.incidentId !== undefined) params.incidentId = options.incidentId
+  return params
+}
+
+/**
+ * Returns whether the AI Brief button/panel should be shown.
+ * Strictly proctor-only: candidates must never see the brief UI.
+ */
+export function shouldShowAiBriefPanel(actorRole: 'proctor' | 'candidate' | null | undefined): boolean {
+  return actorRole === 'proctor'
+}
+
 export function SessionTimelineInspector({
   session,
   onClose,
+  onSessionUpdated,
+  actorRole = null,
 }: SessionTimelineInspectorProps) {
   const [data, setData] = useState<SessionTimelineData | null>(null)
   const [loading, setLoading] = useState(true)
@@ -275,6 +390,30 @@ export function SessionTimelineInspector({
   const [cursorSeq, setCursorSeq] = useState(0)
   const [cursorTimestamp, setCursorTimestamp] = useState(session.createdAt)
 
+  const [currentDisposition, setCurrentDisposition] = useState<ReviewDisposition>(
+    session.disposition ?? 'unreviewed',
+  )
+  const [updatingDisposition, setUpdatingDisposition] = useState(false)
+  const [dispositionError, setDispositionError] = useState<string | null>(null)
+
+  const [annotations, setAnnotations] = useState<ProctorAnnotation[]>([])
+  const [loadingAnnotations, setLoadingAnnotations] = useState(false)
+  const [annotationError, setAnnotationError] = useState<string | null>(null)
+
+  const [composerOpen, setComposerOpen] = useState(false)
+  const [composerNotes, setComposerNotes] = useState('')
+  const [composerDisposition, setComposerDisposition] = useState<ReviewDisposition>('needs_review')
+  const [composerAnchor, setComposerAnchor] = useState<TimelineAnchor | null>(null)
+  const [composerIncidentId, setComposerIncidentId] = useState<string | null>(null)
+  const [composerSubmitting, setComposerSubmitting] = useState(false)
+  const [composerError, setComposerError] = useState<string | null>(null)
+
+  // AI Brief state — proctor-only; server enforces RBAC independently
+  const [brief, setBrief] = useState<AiIncidentBrief | null>(null)
+  const [briefOpen, setBriefOpen] = useState(false)
+  const [briefLoading, setBriefLoading] = useState(false)
+  const [briefError, setBriefError] = useState<string | null>(null)
+
   const inFlightRef = useRef(false)
   const previousDataRef = useRef<SessionTimelineData | null>(null)
   const currentSessionIdRef = useRef(session.id)
@@ -283,6 +422,140 @@ export function SessionTimelineInspector({
     currentSessionIdRef.current = session.id
     previousDataRef.current = null
   }
+
+  const handleSetDisposition = useCallback(
+    async (newDisposition: ReviewDisposition) => {
+      if (newDisposition === currentDisposition) return
+      setUpdatingDisposition(true)
+      setDispositionError(null)
+      try {
+        const updated = await callWorkerAction<AssessmentSession>('set_session_disposition', {
+          sessionId: session.id,
+          disposition: newDisposition,
+        })
+        setCurrentDisposition(updated.disposition ?? newDisposition)
+        onSessionUpdated?.(updated)
+      } catch (error) {
+        setDispositionError(getActionErrorMessage(error))
+      } finally {
+        setUpdatingDisposition(false)
+      }
+    },
+    [currentDisposition, onSessionUpdated, session.id],
+  )
+
+  const fetchAnnotations = useCallback(
+    async (signal?: AbortSignal) => {
+      setLoadingAnnotations(true)
+      try {
+        const list = await callWorkerAction<ProctorAnnotation[]>(
+          'get_session_annotations',
+          { sessionId: session.id },
+          signal,
+        )
+        if (!signal?.aborted) {
+          setAnnotations(list)
+          setAnnotationError(null)
+        }
+      } catch (err: unknown) {
+        if (!signal?.aborted) {
+          setAnnotationError(getActionErrorMessage(err))
+        }
+      } finally {
+        if (!signal?.aborted) {
+          setLoadingAnnotations(false)
+        }
+      }
+    },
+    [session.id],
+  )
+
+  const openAnnotateAtCursor = useCallback(() => {
+    setComposerAnchor(buildTimelineAnchor(session.id, cursorSeq, cursorTimestamp))
+    setComposerIncidentId(null)
+    setComposerNotes('')
+    setComposerDisposition('needs_review')
+    setComposerError(null)
+    setComposerOpen(true)
+  }, [cursorSeq, cursorTimestamp, session.id])
+
+  const openAnnotateIncident = useCallback((incident: IntegrityIncident) => {
+    setComposerAnchor(buildIncidentAnnotationAnchor(incident))
+    setComposerIncidentId(incident.id)
+    setComposerNotes(`Incident: ${incident.kind} (seq ${incident.startSeq}-${incident.endSeq})`)
+    setComposerDisposition('flagged')
+    setComposerError(null)
+    setComposerOpen(true)
+  }, [])
+
+  const closeComposer = useCallback(() => {
+    setComposerOpen(false)
+    setComposerAnchor(null)
+    setComposerIncidentId(null)
+    setComposerNotes('')
+    setComposerError(null)
+  }, [])
+
+  const submitComposer = useCallback(
+    async (event: React.FormEvent) => {
+      event.preventDefault()
+      if (!composerNotes.trim()) {
+        setComposerError('Notes cannot be empty')
+        return
+      }
+      setComposerSubmitting(true)
+      setComposerError(null)
+      try {
+        const created = await callWorkerAction<ProctorAnnotation>('add_proctor_annotation', {
+          sessionId: session.id,
+          notes: composerNotes.trim(),
+          disposition: composerDisposition,
+          anchor: composerAnchor ?? undefined,
+          incidentId: composerIncidentId ?? undefined,
+        })
+        setAnnotations((prev) => [...prev, created])
+        closeComposer()
+      } catch (err: unknown) {
+        setComposerError(getActionErrorMessage(err))
+      } finally {
+        setComposerSubmitting(false)
+      }
+    },
+    [
+      closeComposer,
+      composerAnchor,
+      composerDisposition,
+      composerIncidentId,
+      composerNotes,
+      session.id,
+    ],
+  )
+
+  const requestAiBrief = useCallback(
+    async (options: {
+      startSeq?: number
+      endSeq?: number
+      startTimestamp?: number
+      endTimestamp?: number
+      incidentId?: string
+    } = {}) => {
+      setBriefLoading(true)
+      setBriefError(null)
+      setBriefOpen(true)
+      try {
+        const result = await callWorkerAction<AiIncidentBrief>(
+          'request_ai_overview',
+          buildAiBriefParams(session.id, options),
+        )
+        setBrief(result)
+      } catch (err: unknown) {
+        setBriefError(getActionErrorMessage(err))
+      } finally {
+        setBriefLoading(false)
+      }
+    },
+    [session.id],
+  )
 
   const fetchTimelineData = useCallback(
     async (isManualOrInitial: boolean, signal?: AbortSignal) => {
@@ -355,6 +628,7 @@ export function SessionTimelineInspector({
     const controller = new AbortController()
 
     void fetchTimelineData(true, controller.signal)
+    void fetchAnnotations(controller.signal)
 
     let timerId: ReturnType<typeof setTimeout> | null = null
 
@@ -382,7 +656,7 @@ export function SessionTimelineInspector({
       controller.abort()
       if (timerId) clearTimeout(timerId)
     }
-  }, [fetchTimelineData, isPaused, refreshKey, session.id, session.status])
+  }, [fetchAnnotations, fetchTimelineData, isPaused, refreshKey, session.id, session.status])
 
   const points = useMemo(
     () => (data ? projectTimelinePoints(data.telemetryEvents, data.codeSnapshots) : []),
@@ -412,6 +686,14 @@ export function SessionTimelineInspector({
     reconstructed?.activeIncidents.map((incident) => incident.id) ?? [],
   )
   const nearbyEvents = reconstructed?.nearbyEvents ?? []
+  const cursorAnnotations = useMemo(
+    () => findAnnotationsAtCursor(annotations, cursorSeq),
+    [annotations, cursorSeq],
+  )
+  const incidentAnnotations = useMemo(
+    () => groupAnnotationsByIncident(annotations),
+    [annotations],
+  )
 
   return (
     <section
@@ -437,7 +719,30 @@ export function SessionTimelineInspector({
             Complete persisted history · session {session.id}
           </p>
         </div>
-        <div className="flex flex-wrap gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex items-center gap-1.5 text-xs">
+            <span className="font-medium text-muted-foreground">Disposition:</span>
+            <select
+              aria-label="Set session review disposition"
+              className="h-8 rounded-md border border-border bg-background px-2 py-1 text-xs font-medium"
+              value={currentDisposition}
+              disabled={updatingDisposition}
+              onChange={(e) => void handleSetDisposition(e.target.value as ReviewDisposition)}
+            >
+              <option value="unreviewed">Unreviewed</option>
+              <option value="clear">Clear</option>
+              <option value="needs_review">Needs review</option>
+              <option value="flagged">Flagged</option>
+            </select>
+            <Badge variant={dispositionBadgeVariant(currentDisposition)}>
+              {currentDisposition.replace('_', ' ')}
+            </Badge>
+          </div>
+          {dispositionError && (
+            <span role="alert" className="text-xs text-destructive">
+              {dispositionError}
+            </span>
+          )}
           {session.status === 'active' && (
             <Button
               variant="outline"
@@ -456,6 +761,17 @@ export function SessionTimelineInspector({
           >
             Refresh
           </Button>
+          {shouldShowAiBriefPanel(actorRole) && (
+            <Button
+              variant="outline"
+              size="sm"
+              aria-label="Request AI incident brief for this session"
+              loading={briefLoading}
+              onClick={() => void requestAiBrief({ startSeq: bounds.minSeq || undefined, endSeq: bounds.maxSeq || undefined })}
+            >
+              AI Brief
+            </Button>
+          )}
           <Button variant="outline" size="sm" onClick={onClose}>
             Close
           </Button>
@@ -679,16 +995,31 @@ export function SessionTimelineInspector({
             <section className="space-y-2" aria-label="Reconstructed code">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <h5 className="font-medium">Reconstructed code at cursor</h5>
-                {points.length > 0 && reconstructed && (
-                  <div className="flex gap-2">
-                    <Badge variant="outline">
-                      Historical focus: {reconstructed.activeFlags.focused ? 'focused' : 'unfocused'}
+                <div className="flex flex-wrap items-center gap-2">
+                  {points.length > 0 && reconstructed && (
+                    <div className="flex gap-2">
+                      <Badge variant="outline">
+                        Historical focus: {reconstructed.activeFlags.focused ? 'focused' : 'unfocused'}
+                      </Badge>
+                      <Badge variant="outline">
+                        Historical connection: {reconstructed.activeFlags.connected ? 'connected' : 'disconnected'}
+                      </Badge>
+                    </div>
+                  )}
+                  {cursorAnnotations.length > 0 && (
+                    <Badge variant="warning">
+                      {cursorAnnotations.length} note{cursorAnnotations.length === 1 ? '' : 's'} at seq {cursorSeq}
                     </Badge>
-                    <Badge variant="outline">
-                      Historical connection: {reconstructed.activeFlags.connected ? 'connected' : 'disconnected'}
-                    </Badge>
-                  </div>
-                )}
+                  )}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 text-xs"
+                    onClick={openAnnotateAtCursor}
+                  >
+                    Annotate at cursor (seq {cursorSeq})
+                  </Button>
+                </div>
               </div>
               <p className="text-xs text-muted-foreground">
                 Current live connection from the session record: {session.isConnected ? 'Connected' : 'Disconnected'}
@@ -752,6 +1083,7 @@ export function SessionTimelineInspector({
               <ul className="space-y-3">
                 {incidents.map((incident) => {
                   const isActive = activeIncidentIds.has(incident.id)
+                  const matchingAnnotations = incidentAnnotations.get(incident.id) ?? []
                   return (
                     <li key={incident.id} className="space-y-3 rounded-md border border-border p-3">
                       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -773,7 +1105,7 @@ export function SessionTimelineInspector({
                           </div>
                         ))}
                       </dl>
-                      <div className="flex flex-wrap gap-2" aria-label="Incident evidence sequence jumps">
+                      <div className="flex flex-wrap items-center gap-2" aria-label="Incident evidence sequence jumps">
                         {incident.evidence.map((evidence) => (
                           <Button
                             key={`${incident.id}:${evidence.seq}`}
@@ -792,6 +1124,19 @@ export function SessionTimelineInspector({
                             seq {evidence.seq} · {evidence.eventType} · {formatTimestamp(evidence.clientTimestamp)}
                           </Button>
                         ))}
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-8 border-warning/40 text-xs"
+                          onClick={() => openAnnotateIncident(incident)}
+                        >
+                          Annotate incident
+                        </Button>
+                        {matchingAnnotations.map((ann) => (
+                          <Badge key={ann.id} variant={dispositionBadgeVariant(ann.disposition)}>
+                            {ann.disposition} note
+                          </Badge>
+                        ))}
                       </div>
                     </li>
                   )
@@ -799,6 +1144,292 @@ export function SessionTimelineInspector({
               </ul>
             )}
           </section>
+
+          {composerOpen && (
+            <form
+              onSubmit={(e) => void submitComposer(e)}
+              className="space-y-3 rounded-lg border border-primary/40 bg-muted/30 p-4"
+              aria-label="Add review annotation form"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h5 className="font-semibold text-sm">
+                  {composerIncidentId
+                    ? `Annotate incident (${composerIncidentId})`
+                    : composerAnchor
+                      ? `Annotate timeline at seq ${composerAnchor.seq}`
+                      : 'Add proctor review annotation'}
+                </h5>
+                {composerAnchor && (
+                  <span className="text-xs text-muted-foreground">
+                    Anchor: seq {composerAnchor.seq} · {formatTimestamp(composerAnchor.timestamp)}
+                  </span>
+                )}
+              </div>
+              <div className="flex flex-wrap items-center gap-3">
+                <label className="text-xs font-medium">
+                  Disposition:
+                  <select
+                    className="ml-2 h-7 rounded border border-border bg-background px-2 py-0.5 text-xs font-medium"
+                    value={composerDisposition}
+                    onChange={(e) => setComposerDisposition(e.target.value as ReviewDisposition)}
+                  >
+                    <option value="unreviewed">Unreviewed</option>
+                    <option value="clear">Clear</option>
+                    <option value="needs_review">Needs review</option>
+                    <option value="flagged">Flagged</option>
+                  </select>
+                </label>
+              </div>
+              <Textarea
+                aria-label="Annotation notes"
+                className="min-h-20 text-xs"
+                placeholder="Enter review notes, observations, or incident explanations…"
+                value={composerNotes}
+                onChange={(e) => setComposerNotes(e.target.value)}
+              />
+              {composerError && (
+                <p role="alert" className="text-xs text-destructive">
+                  {composerError}
+                </p>
+              )}
+              <div className="flex justify-end gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={closeComposer}
+                  disabled={composerSubmitting}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="submit"
+                  size="sm"
+                  loading={composerSubmitting}
+                >
+                  Save annotation
+                </Button>
+              </div>
+            </form>
+          )}
+
+          <section className="space-y-3" aria-label="Proctor review annotations">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h5 className="font-medium">Proctor review annotations</h5>
+                <p className="text-xs text-muted-foreground">
+                  Proctor-authored review notes, incident tags, and timeline anchors.
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <Badge variant="outline">{annotations.length}</Badge>
+                {!composerOpen && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={openAnnotateAtCursor}
+                  >
+                    Annotate at cursor (seq {cursorSeq})
+                  </Button>
+                )}
+              </div>
+            </div>
+
+            {loadingAnnotations && annotations.length === 0 && (
+              <p className="text-sm text-muted-foreground">Loading review annotations…</p>
+            )}
+            {annotationError && (
+              <p role="alert" className="text-xs text-destructive">
+                {annotationError}
+              </p>
+            )}
+
+            {annotations.length === 0 && !loadingAnnotations ? (
+              <p className="rounded-md border border-border p-3 text-sm text-muted-foreground">
+                No annotations have been recorded for this session yet. Use &ldquo;Annotate at cursor&rdquo; or &ldquo;Annotate incident&rdquo; above to record review findings.
+              </p>
+            ) : (
+              <ul className="space-y-2">
+                {annotations.map((ann) => (
+                  <li
+                    key={ann.id}
+                    className="space-y-2 rounded-md border border-border p-3 text-xs"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <Badge variant={dispositionBadgeVariant(ann.disposition)}>
+                          {ann.disposition.replace('_', ' ')}
+                        </Badge>
+                        <span className="font-medium text-foreground">
+                          {ann.proctorId}
+                        </span>
+                        <span className="text-muted-foreground">
+                          · {formatTimestamp(ann.createdAt)}
+                        </span>
+                      </div>
+                      {ann.anchor && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-6 px-2 text-[11px]"
+                          onClick={() => {
+                            const next = jumpToEvidenceSeq(
+                              ann.anchor!.seq,
+                              ann.anchor!.timestamp,
+                            )
+                            setCursorMode(next.mode)
+                            setCursorSeq(next.seq)
+                            setCursorTimestamp(next.timestamp)
+                          }}
+                        >
+                          Jump to anchor (seq {ann.anchor.seq})
+                        </Button>
+                      )}
+                    </div>
+                    <p className="text-foreground whitespace-pre-wrap">{ann.notes}</p>
+                    {(ann.incidentId || ann.anchor) && (
+                      <div className="flex flex-wrap gap-2 text-muted-foreground text-[11px]">
+                        {ann.incidentId && (
+                          <span className="rounded bg-muted/60 px-1.5 py-0.5">
+                            Incident: {ann.incidentId}
+                          </span>
+                        )}
+                        {ann.anchor && (
+                          <span className="rounded bg-muted/60 px-1.5 py-0.5">
+                            Anchor: seq {ann.anchor.seq} ({formatTimestamp(ann.anchor.timestamp)})
+                          </span>
+                        )}
+                      </div>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+
+          {shouldShowAiBriefPanel(actorRole) && briefOpen && (
+            <section
+              className="space-y-3 rounded-lg border border-primary/30 bg-muted/20 p-4"
+              aria-label="AI incident brief"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h5 className="font-semibold text-sm">AI Incident Brief</h5>
+                  <p className="text-xs text-muted-foreground">
+                    Triage aid grounded in browser-level telemetry signals — not proof of misconduct.
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 text-xs"
+                    aria-label="Refresh AI brief for current window"
+                    loading={briefLoading}
+                    onClick={() =>
+                      void requestAiBrief({
+                        startSeq: bounds.minSeq || undefined,
+                        endSeq: bounds.maxSeq || undefined,
+                      })
+                    }
+                  >
+                    Refresh brief
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 text-xs"
+                    aria-label="Close AI brief panel"
+                    onClick={() => setBriefOpen(false)}
+                  >
+                    ✕
+                  </Button>
+                </div>
+              </div>
+
+              {briefLoading && !brief && (
+                <p role="status" className="text-sm text-muted-foreground">
+                  Generating brief…
+                </p>
+              )}
+              {briefError && (
+                <p role="alert" className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
+                  {briefError}
+                </p>
+              )}
+
+              {brief && !briefLoading && (
+                <>
+                  <div className="space-y-1">
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                      <span>Window: seq {brief.startSeq}–{brief.endSeq}</span>
+                      <span>·</span>
+                      <span>{formatTimestamp(brief.startTimestamp)} – {formatTimestamp(brief.endTimestamp)}</span>
+                      {brief.incidentKind && (
+                        <>
+                          <span>·</span>
+                          <Badge variant="outline" className="text-[10px]">{brief.incidentKind}</Badge>
+                        </>
+                      )}
+                    </div>
+                    <p className="text-sm">{brief.summary}</p>
+                  </div>
+
+                  {brief.citations.length > 0 && (
+                    <div className="space-y-1">
+                      <h6 className="text-xs font-medium text-muted-foreground">
+                        Citations — click to jump scrubber
+                      </h6>
+                      <ol className="space-y-1">
+                        {brief.citations.map((citation, index) => (
+                          <li key={`${citation.source}:${citation.seq}:${index}`}>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-auto w-full justify-start gap-2 px-2 py-1 text-left text-[11px] font-normal"
+                              aria-label={`Jump to seq ${citation.seq} (${citation.source})`}
+                              onClick={() => {
+                                const next = jumpToEvidenceSeq(citation.seq, citation.timestamp)
+                                setCursorMode(next.mode)
+                                setCursorSeq(next.seq)
+                                setCursorTimestamp(next.timestamp)
+                              }}
+                            >
+                              <Badge variant="outline" className="shrink-0 text-[9px]">
+                                {citation.source === 'telemetry_event'
+                                  ? 'event'
+                                  : citation.source === 'snapshot'
+                                    ? 'snap'
+                                    : 'diff'}
+                              </Badge>
+                              <span>
+                                seq {citation.seq} · {formatTimestamp(citation.timestamp)}
+                                {citation.source === 'telemetry_event'
+                                  ? ` · ${citation.eventType}`
+                                  : citation.source === 'snapshot'
+                                    ? ` · ${citation.snapshotId}`
+                                    : ''}
+                              </span>
+                            </Button>
+                          </li>
+                        ))}
+                      </ol>
+                    </div>
+                  )}
+
+                  {brief.citations.length === 0 && (
+                    <p className="text-sm text-muted-foreground">No citations in this window.</p>
+                  )}
+
+                  <p className="rounded-md bg-muted/40 p-2 text-[11px] text-muted-foreground">
+                    This brief summarises browser-level signals (focus events, paste bursts, connection
+                    changes, code snapshots). It is a triage aid for human reviewers — not evidence of
+                    misconduct and not a replacement for human judgment.
+                  </p>
+                </>
+              )}
+            </section>
+          )}
 
           <p className="rounded-md bg-muted/50 p-3 text-xs text-muted-foreground">
             These are browser-level telemetry signals for human review, not proof of misconduct. Monitoring is limited to browser tab focus, paste bursts, test runs, and connection status. There is no OS lockdown, webcam monitoring, or screen recording.

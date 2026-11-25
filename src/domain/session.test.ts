@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { toSessionContext } from './session'
+import { getEffectiveSessionStatus, isSessionExpired, toSessionContext } from './session'
 import type { AssessmentSession, CuratedTestCase, ProblemPrompt } from './session'
 
 const prompt: ProblemPrompt = {
@@ -57,5 +57,23 @@ describe('assessment session domain types', () => {
       candidateId: assessment.candidateId,
       status: assessment.status,
     })
+  })
+
+  it('detects expired pending and active sessions while preserving submitted status', () => {
+    const deadline = assessment.expiresAt
+    expect(isSessionExpired({ status: 'pending', expiresAt: deadline }, deadline - 1)).toBe(false)
+    expect(getEffectiveSessionStatus({ status: 'pending', expiresAt: deadline }, deadline - 1)).toBe('pending')
+
+    expect(isSessionExpired({ status: 'pending', expiresAt: deadline }, deadline)).toBe(true)
+    expect(getEffectiveSessionStatus({ status: 'pending', expiresAt: deadline }, deadline)).toBe('timed_out')
+
+    expect(isSessionExpired({ status: 'active', expiresAt: deadline }, deadline + 1000)).toBe(true)
+    expect(getEffectiveSessionStatus({ status: 'active', expiresAt: deadline }, deadline + 1000)).toBe('timed_out')
+
+    expect(isSessionExpired({ status: 'timed_out', expiresAt: deadline + 10_000 }, deadline)).toBe(true)
+    expect(getEffectiveSessionStatus({ status: 'timed_out', expiresAt: deadline + 10_000 }, deadline)).toBe('timed_out')
+
+    expect(isSessionExpired({ status: 'submitted', expiresAt: deadline }, deadline + 10_000)).toBe(false)
+    expect(getEffectiveSessionStatus({ status: 'submitted', expiresAt: deadline }, deadline + 10_000)).toBe('submitted')
   })
 })

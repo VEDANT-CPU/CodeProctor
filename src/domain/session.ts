@@ -104,6 +104,29 @@ export interface AssessmentSession {
 }
 
 /**
+ * Returns whether a session is timed out or past its `expiresAt` deadline
+ * while still in a non-terminal (`pending` or `active`) state.
+ */
+export function isSessionExpired(
+  session: Pick<AssessmentSession, 'status' | 'expiresAt'>,
+  now: number = Date.now(),
+): boolean {
+  if (session.status === 'timed_out') return true
+  return (session.status === 'pending' || session.status === 'active') && now >= session.expiresAt
+}
+
+/**
+ * Returns the effective lifecycle status of a session, projecting expired
+ * `pending` or `active` sessions to `timed_out` without mutating `submitted`.
+ */
+export function getEffectiveSessionStatus(
+  session: Pick<AssessmentSession, 'status' | 'expiresAt'>,
+  now: number = Date.now(),
+): SessionStatus {
+  return isSessionExpired(session, now) ? 'timed_out' : session.status
+}
+
+/**
  * Projects an assessment session to the minimal shape expected by RBAC guards.
  */
 export function toSessionContext(session: AssessmentSession): SessionContext {

@@ -2,20 +2,32 @@ import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useQuery } from 'deepspace'
 import type { RecordData } from 'deepspace'
-import type { AssessmentSession } from '../../domain/session'
+import type { ReviewDisposition } from '../../domain/review'
+import { getEffectiveSessionStatus, type AssessmentSession } from '../../domain/session'
 import type { CodeSnapshot, TelemetryEvent } from '../../domain/telemetry'
 import { useActorContext } from '../../hooks/useActorContext'
 import { callWorkerAction, getActionErrorMessage } from '../../lib/action-client'
 import { Badge, Button, buttonVariants } from '../ui'
 import { CandidateSessionEntry, SessionStatus } from './CandidateSessionEntry'
 import { CreateSessionForm } from './CreateSessionForm'
-import { SessionTimelineInspector } from './SessionTimelineInspector'
+import {
+  SessionTimelineInspector,
+  dispositionBadgeVariant,
+} from './SessionTimelineInspector'
 
 type PersistedTelemetryEvent = TelemetryEvent & { candidateId: string }
 type PersistedCodeSnapshot = CodeSnapshot & { candidateId: string }
 
 function timestamp(value: number | null): string {
   return value === null ? 'Not set' : new Date(value).toLocaleString()
+}
+
+function SessionDispositionBadge({ disposition }: { disposition: ReviewDisposition }) {
+  return (
+    <Badge variant={dispositionBadgeVariant(disposition)}>
+      {disposition.replace('_', ' ')}
+    </Badge>
+  )
 }
 
 function ProctorSessionList() {
@@ -44,6 +56,7 @@ function ProctorSessionList() {
   })
   const [createdSessions, setCreatedSessions] = useState<AssessmentSession[]>([])
   const [startingSessionId, setStartingSessionId] = useState<string | null>(null)
+  const [updatingDispositionId, setUpdatingDispositionId] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
 
@@ -54,6 +67,25 @@ function ProctorSessionList() {
   const sessions = new Map<string, AssessmentSession>()
   for (const session of [...storedSessions, ...createdSessions]) sessions.set(session.id, session)
   const listedSessions = [...sessions.values()].sort((a, b) => b.createdAt - a.createdAt)
+
+  async function updateDisposition(sessionId: string, disposition: ReviewDisposition) {
+    setUpdatingDispositionId(sessionId)
+    setActionError(null)
+    try {
+      const updated = await callWorkerAction<AssessmentSession>('set_session_disposition', {
+        sessionId,
+        disposition,
+      })
+      setCreatedSessions((previous) => [
+        updated,
+        ...previous.filter((session) => session.id !== updated.id),
+      ])
+    } catch (error) {
+      setActionError(getActionErrorMessage(error))
+    } finally {
+      setUpdatingDispositionId(null)
+    }
+  }
 
   async function startSession(sessionId: string) {
     setStartingSessionId(sessionId)
@@ -136,6 +168,8 @@ function ProctorSessionList() {
                 null,
               )
 
+              const effectiveStatus = getEffectiveSessionStatus(session)
+
               return (
                 <article key={session.id} className="space-y-4 rounded-xl border border-border bg-card p-5">
                   <div className="flex flex-wrap items-start justify-between gap-3">
@@ -145,7 +179,10 @@ function ProctorSessionList() {
                         {session.id} · candidate {session.candidateId}
                       </p>
                     </div>
-                    <SessionStatus status={session.status} />
+                    <div className="flex flex-wrap items-center gap-2">
+                      <SessionDispositionBadge disposition={session.disposition ?? 'unreviewed'} />
+                      <SessionStatus status={effectiveStatus} />
+                    </div>
                   </div>
                   <dl className="grid gap-3 text-sm sm:grid-cols-3">
                     <div><dt className="text-muted-foreground">Created</dt><dd>{timestamp(session.createdAt)}</dd></div>
@@ -169,8 +206,8 @@ function ProctorSessionList() {
                       </p>
                     </div>
                   )}
-                  <div className="flex flex-wrap gap-2">
-                    {session.status === 'pending' && (
+                  <div className="flex flex-wrap items-center gap-2">
+                    {effectiveStatus === 'pending' && (
                       <Button
                         onClick={() => void startSession(session.id)}
                         loading={startingSessionId === session.id}
@@ -196,11 +233,34 @@ function ProctorSessionList() {
                     >
                       {selectedSessionId === session.id ? 'Timeline open' : 'Inspect timeline'}
                     </Button>
+                    <div className="flex items-center gap-1.5 text-xs">
+                      <span className="text-muted-foreground">Review:</span>
+                      <select
+                        aria-label={`Update disposition for session ${session.id}`}
+                        className="h-8 rounded-md border border-border bg-background px-2 py-1 text-xs"
+                        value={session.disposition ?? 'unreviewed'}
+                        disabled={updatingDispositionId === session.id}
+                        onChange={(e) =>
+                          void updateDisposition(session.id, e.target.value as ReviewDisposition)
+                        }
+                      >
+                        <option value="unreviewed">Unreviewed</option>
+                        <option value="clear">Clear</option>
+                        <option value="needs_review">Needs review</option>
+                        <option value="flagged">Flagged</option>
+                      </select>
+                    </div>
                   </div>
                   {selectedSessionId === session.id && (
                     <SessionTimelineInspector
                       session={session}
                       onClose={() => setSelectedSessionId(null)}
+                      onSessionUpdated={(updated) =>
+                        setCreatedSessions((previous) => [
+                          updated,
+                          ...previous.filter((s) => s.id !== updated.id),
+                        ])
+                      }
                     />
                   )}
                 </article>
