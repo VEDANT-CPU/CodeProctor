@@ -244,11 +244,17 @@ async function loadSession(
   }
 
   const record = result.data.record
-  if (
-    !isStoredAssessmentSession(record.data) ||
-    record.data.id !== record.recordId ||
-    record.recordId !== sessionId
-  ) {
+  const isValidShape = isStoredAssessmentSession(record.data)
+  const idsMatch = isObject(record.data) && record.data.id === record.recordId && record.recordId === sessionId
+  if (!isValidShape || !idsMatch) {
+    console.warn('loadSession invalid record debug', {
+      sessionId,
+      recordId: record.recordId,
+      dataId: isObject(record.data) ? record.data.id : undefined,
+      isValidShape,
+      recordKeys: isObject(record) ? Object.keys(record) : typeof record,
+      dataKeys: isObject(record.data) ? Object.keys(record.data) : typeof record.data,
+    })
     return {
       success: false,
       result: failure('Stored assessment session is invalid', 'invalid_session_record'),
