@@ -1,10 +1,8 @@
 /**
  * Theme catalog.
  *
- * The scaffold ships two placeholder themes: `slate` (dark default, defined
- * in styles.css) and `paper` (light example, defined in themes.css). They
- * are scaffolding, not a design — give the app its own theme before first
- * deploy:
+ * The app ships `slate` (dark default, defined in styles.css) and `paper`
+ * (light example, defined in themes.css):
  *   1. Add a `[data-theme="my-id"] { ... }` block in src/themes.css with
  *      the shadcn token overrides (include `color-scheme: light;` for
  *      light themes).
@@ -20,7 +18,7 @@ export const THEMES = [
   {
     id: 'slate',
     label: 'Slate',
-    description: 'Neutral dark placeholder default. Replace with your own theme.',
+    description: 'Deep slate surfaces with restrained indigo accents.',
   },
   {
     id: 'paper',
