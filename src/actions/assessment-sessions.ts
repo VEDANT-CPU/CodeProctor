@@ -182,8 +182,12 @@ function isProblemPrompt(value: unknown): value is ProblemPrompt {
   )
 }
 
-function isNullableTimestamp(value: unknown): value is number | null {
-  return value === null || (typeof value === 'number' && Number.isFinite(value))
+function isNullableTimestamp(value: unknown): value is number | null | undefined {
+  return (
+    value === null ||
+    value === undefined ||
+    (typeof value === 'number' && Number.isFinite(value))
+  )
 }
 
 function isStoredAssessmentSession(value: unknown): value is StoredAssessmentSession {
@@ -263,6 +267,9 @@ async function loadSession(
   const data = record.data
   const session: AssessmentSession = {
     ...data,
+    startedAt: data.startedAt ?? null,
+    submittedAt: data.submittedAt ?? null,
+    lastSeenAt: data.lastSeenAt ?? null,
     disposition: data.disposition ?? 'unreviewed',
     dispositionedAt: data.dispositionedAt ?? null,
     dispositionedByProctorId: data.dispositionedByProctorId ?? null,
