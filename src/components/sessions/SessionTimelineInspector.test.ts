@@ -1,8 +1,10 @@
+// @vitest-environment node
+
 import { describe, expect, it } from 'vitest'
 import type { AssessmentSession } from '../../domain/session'
 import type { TimelinePoint, CodeDelta, SnapshotTimelinePoint } from '../../domain/timeline'
 import type { TelemetryEvent, SnapshotTrigger } from '../../domain/telemetry'
-import type { ProctorAnnotation, ReviewDisposition, AiIncidentBrief, IncidentCitation } from '../../domain/review'
+import type { ProctorAnnotation, ReviewDisposition } from '../../domain/review'
 import type { IntegrityIncident } from '../../domain/incidents'
 import {
   buildIncidentAnnotationAnchor,
@@ -22,8 +24,6 @@ import {
   shouldAutoRefresh,
   stepTimestamp,
   switchCursorMode,
-  buildAiBriefParams,
-  shouldShowAiBriefPanel,
   DEFAULT_LIVE_REFRESH_INTERVAL_MS,
   SEQUENCE_SCRUBBING_NOTE,
   TIMESTAMP_SCRUBBING_NOTE,
@@ -772,158 +772,20 @@ describe('SessionTimelineInspector helpers and timeline reconstruction', () => {
   })
 })
 
-// ---------------------------------------------------------------------------
-// AI Brief helpers
-// ---------------------------------------------------------------------------
-
-describe('AI Brief helpers', () => {
-  describe('shouldShowAiBriefPanel', () => {
-    it('returns true only for proctor role', () => {
-      expect(shouldShowAiBriefPanel('proctor')).toBe(true)
-      expect(shouldShowAiBriefPanel('candidate')).toBe(false)
-      expect(shouldShowAiBriefPanel(null)).toBe(false)
-      expect(shouldShowAiBriefPanel(undefined)).toBe(false)
-    })
-
-    it('never returns true for a candidate — isolation is strict', () => {
-      // Explicit paranoia check: no input that is not exactly 'proctor' should pass.
-      const candidateInputs: Array<'proctor' | 'candidate' | null | undefined> = [
-        'candidate',
-        null,
-        undefined,
-      ]
-      for (const role of candidateInputs) {
-        expect(shouldShowAiBriefPanel(role)).toBe(false)
-      }
+describe('timeline evidence jumps', () => {
+  it('switches to sequence mode at an evidence sequence and timestamp', () => {
+    expect(jumpToEvidenceSeq(12, 55_000)).toEqual({
+      mode: 'seq',
+      seq: 12,
+      timestamp: 55_000,
     })
   })
 
-  describe('buildAiBriefParams', () => {
-    it('always includes sessionId', () => {
-      const params = buildAiBriefParams('session-abc')
-      expect(params).toEqual({ sessionId: 'session-abc' })
-    })
-
-    it('includes only the optional fields that are explicitly provided', () => {
-      const full = buildAiBriefParams('session-xyz', {
-        startSeq: 3,
-        endSeq: 15,
-        startTimestamp: 1_000,
-        endTimestamp: 9_000,
-        incidentId: 'inc-paste-1',
-      })
-      expect(full).toEqual({
-        sessionId: 'session-xyz',
-        startSeq: 3,
-        endSeq: 15,
-        startTimestamp: 1_000,
-        endTimestamp: 9_000,
-        incidentId: 'inc-paste-1',
-      })
-    })
-
-    it('omits undefined optional fields (no spurious keys)', () => {
-      const params = buildAiBriefParams('session-abc', { startSeq: 1 })
-      expect(Object.keys(params)).toEqual(['sessionId', 'startSeq'])
-      expect('endSeq' in params).toBe(false)
-      expect('incidentId' in params).toBe(false)
-    })
-
-    it('handles empty options object identically to no options arg', () => {
-      expect(buildAiBriefParams('s')).toEqual(buildAiBriefParams('s', {}))
-    })
-  })
-
-  describe('jumpToEvidenceSeq — citation jump target behaviour', () => {
-    it('returns a seq-mode cursor at the citation seq and timestamp', () => {
-      const target = jumpToEvidenceSeq(12, 55_000)
-      expect(target.mode).toBe('seq')
-      expect(target.seq).toBe(12)
-      expect(target.timestamp).toBe(55_000)
-    })
-
-    it('defaults timestamp to 0 when not supplied', () => {
-      const target = jumpToEvidenceSeq(7)
-      expect(target.mode).toBe('seq')
-      expect(target.seq).toBe(7)
-      expect(target.timestamp).toBe(0)
-    })
-
-    it('a telemetry_event citation with seq=5 and timestamp=5000 jumps to seq 5 in seq mode', () => {
-      // Simulating what the UI does when user clicks a telemetry_event citation
-      const citation: IncidentCitation = {
-        source: 'telemetry_event',
-        sessionId: 'session-1',
-        seq: 5,
-        timestamp: 5_000,
-        eventType: 'LARGE_PASTE',
-      }
-      const jumped = jumpToEvidenceSeq(citation.seq, citation.timestamp)
-      expect(jumped.mode).toBe('seq')
-      expect(jumped.seq).toBe(5)
-      expect(jumped.timestamp).toBe(5_000)
-    })
-
-    it('a snapshot citation with seq=10 and timestamp=10000 jumps to seq 10 in seq mode', () => {
-      const citation: IncidentCitation = {
-        source: 'snapshot',
-        sessionId: 'session-1',
-        seq: 10,
-        timestamp: 10_000,
-        snapshotId: 'snap-10',
-      }
-      const jumped = jumpToEvidenceSeq(citation.seq, citation.timestamp)
-      expect(jumped.mode).toBe('seq')
-      expect(jumped.seq).toBe(10)
-    })
-
-    it('a code_diff citation jumps to its seq in seq mode', () => {
-      const citation: IncidentCitation = {
-        source: 'code_diff',
-        sessionId: 'session-1',
-        seq: 3,
-        timestamp: 3_000,
-      }
-      const jumped = jumpToEvidenceSeq(citation.seq, citation.timestamp)
-      expect(jumped.mode).toBe('seq')
-      expect(jumped.seq).toBe(3)
-    })
-  })
-
-  describe('proctor vs candidate guard — integration with shouldShowAiBriefPanel', () => {
-    it('proctor brief-panel guard is completely independent of session status', () => {
-      // The UI guard is role-only; session status does not affect it
-      // (server enforces per-status RBAC separately via authorizeActorAction)
-      const statuses = ['pending', 'active', 'submitted', 'timed_out'] as const
-      for (const _status of statuses) {
-        expect(shouldShowAiBriefPanel('proctor')).toBe(true)
-        expect(shouldShowAiBriefPanel('candidate')).toBe(false)
-      }
-    })
-
-    it('buildAiBriefParams round-trips correctly for all supported bound combinations', () => {
-      // No bounds
-      expect(buildAiBriefParams('s')).toEqual({ sessionId: 's' })
-
-      // Seq bounds only
-      expect(buildAiBriefParams('s', { startSeq: 1, endSeq: 20 })).toEqual({
-        sessionId: 's',
-        startSeq: 1,
-        endSeq: 20,
-      })
-
-      // Timestamp bounds only
-      expect(buildAiBriefParams('s', { startTimestamp: 0, endTimestamp: 100 })).toEqual({
-        sessionId: 's',
-        startTimestamp: 0,
-        endTimestamp: 100,
-      })
-
-      // incidentId only
-      expect(buildAiBriefParams('s', { incidentId: 'inc-1' })).toEqual({
-        sessionId: 's',
-        incidentId: 'inc-1',
-      })
+  it('defaults the evidence timestamp when omitted', () => {
+    expect(jumpToEvidenceSeq(7)).toEqual({
+      mode: 'seq',
+      seq: 7,
+      timestamp: 0,
     })
   })
 })

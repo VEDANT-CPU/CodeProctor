@@ -59,7 +59,6 @@ describe('session access guards', () => {
     expect(canPerformAction(proctor, 'view_session', session('timed_out'))).toBe(true)
     expect(canPerformAction(proctor, 'scrub_timeline', session('submitted'))).toBe(true)
     expect(canPerformAction(proctor, 'add_session_note', session('timed_out'))).toBe(true)
-    expect(canPerformAction(proctor, 'request_ai_overview', session('submitted'))).toBe(true)
     expect(canPerformAction(proctor, 'set_final_disposition', session('submitted'))).toBe(true)
     expect(canPerformAction(proctor, 'create_assessment_session')).toBe(true)
   })

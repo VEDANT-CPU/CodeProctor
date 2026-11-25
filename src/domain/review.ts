@@ -1,6 +1,3 @@
-import type { IncidentKind } from './incidents'
-import type { TelemetryEventType } from './telemetry'
-
 /** Human review outcome for an assessment session or integrity incident. */
 export type ReviewDisposition =
   /** No reviewer has made a final assessment yet. */
@@ -33,36 +30,6 @@ export interface TimelineAnchor {
   timestamp: number
 }
 
-interface IncidentCitationBase extends TimelineAnchor {
-  /** Optional short label displayed with the citation. */
-  label?: string
-}
-
-/**
- * Reference to a specific telemetry event, full snapshot, or code diff.
- * Every citation includes the exact session sequence and epoch-ms timestamp.
- */
-export type IncidentCitation =
-  | (IncidentCitationBase & {
-      /** Citation refers to a browser telemetry event. */
-      source: 'telemetry_event'
-      /** Event kind at the cited sequence. */
-      eventType: TelemetryEventType
-    })
-  | (IncidentCitationBase & {
-      /** Citation refers to a full code snapshot. */
-      source: 'snapshot'
-      /** Stable identifier of the cited snapshot. */
-      snapshotId: string
-    })
-  | (IncidentCitationBase & {
-      /**
-       * Citation refers to the CODE_EDIT delta identified by `(sessionId, seq)`.
-       * No separate diff ID is needed for an edit already stored in the timeline.
-       */
-      source: 'code_diff'
-    })
-
 /**
  * Proctor-authored review note for a whole session, incident, or timeline
  * position. All timestamps are Unix epoch milliseconds.
@@ -86,38 +53,4 @@ export interface ProctorAnnotation {
   createdAt: number
   /** Most recent edit time as Unix epoch milliseconds. */
   updatedAt: number
-}
-
-/**
- * AI-generated, citation-linked triage aid for a deterministic incident or
- * timeline window. It is not ground-truth evidence or a finding of misconduct.
- * All timestamps are Unix epoch milliseconds; sequence bounds are inclusive.
- */
-export interface AiIncidentBrief {
-  /** Stable brief identifier. */
-  id: string
-  /** Session whose already-recorded telemetry is summarized. */
-  sessionId: string
-  /** Optional deterministic incident summarized by this brief. */
-  incidentId?: string
-  /** First sequence included in the requested review window. */
-  startSeq: number
-  /** Last sequence included in the requested review window. */
-  endSeq: number
-  /** Start of the requested review window as Unix epoch milliseconds. */
-  startTimestamp: number
-  /** End of the requested review window as Unix epoch milliseconds. */
-  endTimestamp: number
-  /** Deterministic incident category, when the brief is incident-specific. */
-  incidentKind?: IncidentKind
-  /** Concise summary grounded only in supplied deterministic signals. */
-  summary: string
-  /** Exact event, snapshot, or diff references supporting the summary. */
-  citations: readonly IncidentCitation[]
-  /** Generation time as Unix epoch milliseconds. */
-  generatedAt: number
-  /** Optional model identifier for auditability. */
-  modelId?: string
-  /** Optional prompt/template version for auditability. */
-  promptVersion?: string
 }

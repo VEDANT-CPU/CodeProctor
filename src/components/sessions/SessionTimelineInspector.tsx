@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { AiIncidentBrief, ProctorAnnotation, ReviewDisposition, TimelineAnchor } from '../../domain/review'
+import type { ProctorAnnotation, ReviewDisposition, TimelineAnchor } from '../../domain/review'
 import { reviewDispositions } from '../../domain/review'
 import type { AssessmentSession } from '../../domain/session'
 import { aggregateIntegrityIncidents } from '../../domain/incidents'
@@ -31,8 +31,6 @@ export interface SessionTimelineInspectorProps {
   session: AssessmentSession
   onClose: () => void
   onSessionUpdated?: (updated: AssessmentSession) => void
-  /** UI-layer actor role for conditional rendering; server enforces RBAC independently. */
-  actorRole?: 'proctor' | 'candidate' | null
 }
 
 /** Scrubbing cursor mode: monotonic sequence or client-observed timestamp. */
@@ -346,39 +344,10 @@ export function reconstructInspectorTimeline(params: {
   }
 }
 
-/** Builds the params object for a request_ai_overview action call. */
-export function buildAiBriefParams(
-  sessionId: string,
-  options: {
-    startSeq?: number
-    endSeq?: number
-    startTimestamp?: number
-    endTimestamp?: number
-    incidentId?: string
-  } = {},
-): Record<string, unknown> {
-  const params: Record<string, unknown> = { sessionId }
-  if (options.startSeq !== undefined) params.startSeq = options.startSeq
-  if (options.endSeq !== undefined) params.endSeq = options.endSeq
-  if (options.startTimestamp !== undefined) params.startTimestamp = options.startTimestamp
-  if (options.endTimestamp !== undefined) params.endTimestamp = options.endTimestamp
-  if (options.incidentId !== undefined) params.incidentId = options.incidentId
-  return params
-}
-
-/**
- * Returns whether the AI Brief button/panel should be shown.
- * Strictly proctor-only: candidates must never see the brief UI.
- */
-export function shouldShowAiBriefPanel(actorRole: 'proctor' | 'candidate' | null | undefined): boolean {
-  return actorRole === 'proctor'
-}
-
 export function SessionTimelineInspector({
   session,
   onClose,
   onSessionUpdated,
-  actorRole = null,
 }: SessionTimelineInspectorProps) {
   const [data, setData] = useState<SessionTimelineData | null>(null)
   const [loading, setLoading] = useState(true)
@@ -407,12 +376,6 @@ export function SessionTimelineInspector({
   const [composerIncidentId, setComposerIncidentId] = useState<string | null>(null)
   const [composerSubmitting, setComposerSubmitting] = useState(false)
   const [composerError, setComposerError] = useState<string | null>(null)
-
-  // AI Brief state — proctor-only; server enforces RBAC independently
-  const [brief, setBrief] = useState<AiIncidentBrief | null>(null)
-  const [briefOpen, setBriefOpen] = useState(false)
-  const [briefLoading, setBriefLoading] = useState(false)
-  const [briefError, setBriefError] = useState<string | null>(null)
 
   const inFlightRef = useRef(false)
   const previousDataRef = useRef<SessionTimelineData | null>(null)
@@ -529,32 +492,6 @@ export function SessionTimelineInspector({
       composerNotes,
       session.id,
     ],
-  )
-
-  const requestAiBrief = useCallback(
-    async (options: {
-      startSeq?: number
-      endSeq?: number
-      startTimestamp?: number
-      endTimestamp?: number
-      incidentId?: string
-    } = {}) => {
-      setBriefLoading(true)
-      setBriefError(null)
-      setBriefOpen(true)
-      try {
-        const result = await callWorkerAction<AiIncidentBrief>(
-          'request_ai_overview',
-          buildAiBriefParams(session.id, options),
-        )
-        setBrief(result)
-      } catch (err: unknown) {
-        setBriefError(getActionErrorMessage(err))
-      } finally {
-        setBriefLoading(false)
-      }
-    },
-    [session.id],
   )
 
   const fetchTimelineData = useCallback(
@@ -761,17 +698,6 @@ export function SessionTimelineInspector({
           >
             Refresh
           </Button>
-          {shouldShowAiBriefPanel(actorRole) && (
-            <Button
-              variant="outline"
-              size="sm"
-              aria-label="Request AI incident brief for this session"
-              loading={briefLoading}
-              onClick={() => void requestAiBrief({ startSeq: bounds.minSeq || undefined, endSeq: bounds.maxSeq || undefined })}
-            >
-              AI Brief
-            </Button>
-          )}
           <Button variant="outline" size="sm" onClick={onClose}>
             Close
           </Button>
@@ -1306,130 +1232,6 @@ export function SessionTimelineInspector({
               </ul>
             )}
           </section>
-
-          {shouldShowAiBriefPanel(actorRole) && briefOpen && (
-            <section
-              className="space-y-3 rounded-lg border border-primary/30 bg-muted/20 p-4"
-              aria-label="AI incident brief"
-            >
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div>
-                  <h5 className="font-semibold text-sm">AI Incident Brief</h5>
-                  <p className="text-xs text-muted-foreground">
-                    Triage aid grounded in browser-level telemetry signals — not proof of misconduct.
-                  </p>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-7 text-xs"
-                    aria-label="Refresh AI brief for current window"
-                    loading={briefLoading}
-                    onClick={() =>
-                      void requestAiBrief({
-                        startSeq: bounds.minSeq || undefined,
-                        endSeq: bounds.maxSeq || undefined,
-                      })
-                    }
-                  >
-                    Refresh brief
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="h-7 text-xs"
-                    aria-label="Close AI brief panel"
-                    onClick={() => setBriefOpen(false)}
-                  >
-                    ✕
-                  </Button>
-                </div>
-              </div>
-
-              {briefLoading && !brief && (
-                <p role="status" className="text-sm text-muted-foreground">
-                  Generating brief…
-                </p>
-              )}
-              {briefError && (
-                <p role="alert" className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
-                  {briefError}
-                </p>
-              )}
-
-              {brief && !briefLoading && (
-                <>
-                  <div className="space-y-1">
-                    <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                      <span>Window: seq {brief.startSeq}–{brief.endSeq}</span>
-                      <span>·</span>
-                      <span>{formatTimestamp(brief.startTimestamp)} – {formatTimestamp(brief.endTimestamp)}</span>
-                      {brief.incidentKind && (
-                        <>
-                          <span>·</span>
-                          <Badge variant="outline" className="text-[10px]">{brief.incidentKind}</Badge>
-                        </>
-                      )}
-                    </div>
-                    <p className="text-sm">{brief.summary}</p>
-                  </div>
-
-                  {brief.citations.length > 0 && (
-                    <div className="space-y-1">
-                      <h6 className="text-xs font-medium text-muted-foreground">
-                        Citations — click to jump scrubber
-                      </h6>
-                      <ol className="space-y-1">
-                        {brief.citations.map((citation, index) => (
-                          <li key={`${citation.source}:${citation.seq}:${index}`}>
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              className="h-auto w-full justify-start gap-2 px-2 py-1 text-left text-[11px] font-normal"
-                              aria-label={`Jump to seq ${citation.seq} (${citation.source})`}
-                              onClick={() => {
-                                const next = jumpToEvidenceSeq(citation.seq, citation.timestamp)
-                                setCursorMode(next.mode)
-                                setCursorSeq(next.seq)
-                                setCursorTimestamp(next.timestamp)
-                              }}
-                            >
-                              <Badge variant="outline" className="shrink-0 text-[9px]">
-                                {citation.source === 'telemetry_event'
-                                  ? 'event'
-                                  : citation.source === 'snapshot'
-                                    ? 'snap'
-                                    : 'diff'}
-                              </Badge>
-                              <span>
-                                seq {citation.seq} · {formatTimestamp(citation.timestamp)}
-                                {citation.source === 'telemetry_event'
-                                  ? ` · ${citation.eventType}`
-                                  : citation.source === 'snapshot'
-                                    ? ` · ${citation.snapshotId}`
-                                    : ''}
-                              </span>
-                            </Button>
-                          </li>
-                        ))}
-                      </ol>
-                    </div>
-                  )}
-
-                  {brief.citations.length === 0 && (
-                    <p className="text-sm text-muted-foreground">No citations in this window.</p>
-                  )}
-
-                  <p className="rounded-md bg-muted/40 p-2 text-[11px] text-muted-foreground">
-                    This brief summarises browser-level signals (focus events, paste bursts, connection
-                    changes, code snapshots). It is a triage aid for human reviewers — not evidence of
-                    misconduct and not a replacement for human judgment.
-                  </p>
-                </>
-              )}
-            </section>
-          )}
 
           <p className="rounded-md bg-muted/50 p-3 text-xs text-muted-foreground">
             These are browser-level telemetry signals for human review, not proof of misconduct. Monitoring is limited to browser tab focus, paste bursts, test runs, and connection status. There is no OS lockdown, webcam monitoring, or screen recording.

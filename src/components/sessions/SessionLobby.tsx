@@ -30,7 +30,7 @@ function SessionDispositionBadge({ disposition }: { disposition: ReviewDispositi
   )
 }
 
-function ProctorSessionList() {
+function ProctorSessionList({ isProctor }: { isProctor: boolean }) {
   const { records, status, error } = useQuery<AssessmentSession>('assessment-sessions', {
     orderBy: 'createdAt',
     orderDir: 'desc',
@@ -285,7 +285,7 @@ export function SessionLobby() {
             Create an assessment, activate pending sessions, and open a session workspace.
           </p>
         </header>
-        <ProctorSessionList />
+        <ProctorSessionList isProctor={isProctor} />
       </main>
     )
   }

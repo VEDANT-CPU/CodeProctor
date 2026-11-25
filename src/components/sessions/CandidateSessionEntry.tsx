@@ -97,6 +97,7 @@ export function CandidateSessionEntry() {
       const session = await callWorkerAction<AssessmentSession>('get_assessment_session', {
         sessionId: sessionId.trim(),
       })
+      setAssignedError(null)
       setJoinedSession(session)
     } catch (error) {
       setJoinedSession(null)

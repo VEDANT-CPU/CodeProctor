@@ -5,7 +5,7 @@
 **CodeProctor** is a real-time coding assessment, integrity telemetry, and session timeline playback platform built on **DeepSpace** (Cloudflare Workers, Hono, React + Vite, SQLite-backed Durable Objects, WebSockets, built-in Auth/RBAC, and DeepSpace integrations).
 
 - **Candidate View:** Distraction-free coding assessment workspace with problem prompt, code editor, curated test execution/submission, offline-buffered telemetry (`focus`/`blur`, paste bursts, edit cadence, reconnects), and clear disclosure of browser-level monitoring boundaries.
-- **Proctor / Reviewer View:** Live multi-session monitor with real-time presence, deterministic incident aggregation (grouping noisy raw signals into actionable integrity flags), snapshot + sequence-ordered timeline scrubbing, and on-demand AI incident briefs anchored to specific timeline events.
+- **Proctor / Reviewer View:** Live multi-session monitor with deterministic incident aggregation (grouping noisy raw signals into actionable integrity flags), snapshot + sequence-ordered timeline scrubbing, and proctor-authored annotations and dispositions.
 
 ---
 
@@ -16,7 +16,7 @@
 
 ### Build Exercise Criteria
 
-1. **Sensible Scope for the Sprint Window:** Prioritize an end-to-end working core (create/join session $\rightarrow$ live coding + telemetry ingestion $\rightarrow$ live proctor monitor + deterministic timeline playback + AI incident brief). Document unfinished edges honestly in the final writeup.
+1. **Sensible Scope for the Sprint Window:** Prioritize an end-to-end working core (create/join session $\rightarrow$ live coding + telemetry ingestion $\rightarrow$ live proctor monitor + deterministic timeline playback and human review). Document unfinished edges honestly in the final writeup.
 2. **Use at Least Three DeepSpace Integrations / Platform Primitives:**
    - Do **not** reimplement platform primitives (auth, real-time sync/Durable Objects, storage, integration proxies, scheduled jobs, or AI helpers) without a documented reason.
    - Explicitly track which DeepSpace integrations were used, why they added value, and why additional integrations were intentionally excluded.
@@ -57,9 +57,9 @@ Every file and abstraction written by an agent must be clean enough for the appl
   - Buffer unsent events in the candidate client during brief network disconnects and flush in `seq` order upon reconnect.
   - Ingestion endpoints must be idempotent by `(sessionId, seq)` so retries never duplicate events or skew integrity flags.
 
-### 3. Deterministic Integrity Signal Aggregation (Before AI)
+### 3. Deterministic Integrity Signal Aggregation
 
-- Raw browser events are noisy. Aggregate raw telemetry into structured **Incidents** using explicit, explainable rules before invoking AI:
+- Raw browser events are noisy. Aggregate raw telemetry into structured **Incidents** using explicit, explainable rules for human review:
   - _Example:_ `PASTE_AFTER_TAB_ABSENCE` (tab hidden $> 15\text{s}$ followed by paste $> 120$ chars within $10\text{s}$).
   - _Example:_ `FOCUS_FLICKER_CLUSTER` ($\ge 4$ blur/focus transitions within $20\text{s}$).
   - _Example:_ `IDLE_GAP_THEN_BURST` (extended inactivity followed by sudden large code insertion).
@@ -71,7 +71,7 @@ Use native DeepSpace capabilities across the stack:
 
 1. **DeepSpace Auth & Role-Based Permissions:** Authenticate candidates and proctors; enforce strict session ownership and reviewer privileges.
 2. **Real-Time State & Durable Objects / Live Sync:** Stream live candidate status, code snapshots, and incident alerts to the proctor dashboard without manual polling.
-3. **DeepSpace AI Integration:** Generate concise, citation-linked **Proctor Incident Briefs** referencing exact `(seq, timestamp)` events and code diffs—used as a triage aid, not a replacement for deterministic telemetry.
+3. **DeepSpace AI Integration:** The general DeepSpace Agent/chat remains available for assistant tasks. Incident assessment stays deterministic and human-reviewed; AI-generated incident briefs are intentionally excluded so the review UI does not present generated summaries as evidence.
 4. **Additional Native Integration (e.g., Scheduled Cleanup/Session Timeout Sweep or Notification/Webhook Integration):** Automatically expire timed-out assessments or notify reviewers when high-severity incidents or submissions occur.
 
 ---

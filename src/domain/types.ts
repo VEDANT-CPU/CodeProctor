@@ -33,7 +33,6 @@ export type SessionAction =
   | 'view_review_notes'
   | 'scrub_timeline'
   | 'create_assessment_session'
-  | 'request_ai_overview'
   | 'add_session_note'
   | 'create_integrity_flag'
   | 'set_final_disposition'

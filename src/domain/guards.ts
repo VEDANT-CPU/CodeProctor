@@ -14,7 +14,6 @@ const proctorActions: readonly SessionAction[] = [
   'view_session',
   'view_review_notes',
   'scrub_timeline',
-  'request_ai_overview',
   'add_session_note',
   'create_integrity_flag',
   'set_final_disposition',

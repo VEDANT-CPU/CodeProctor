@@ -6,8 +6,11 @@ import { Button } from '../../../../components/ui'
 import { callWorkerAction, getActionErrorMessage } from '../../../../lib/action-client'
 import { SessionTelemetryCollector } from '../../../../lib/session-telemetry'
 
+//console.log('SessionWorkspacePage mounted', { sessionId, pathname: window.location.pathname })
+
 export default function SessionWorkspacePage() {
   const { sessionId } = useParams<{ sessionId: string }>()
+  console.log('[SessionWorkspacePage] render/mounted', { sessionId })
   const [seededCollector, setSeededCollector] = useState<SessionTelemetryCollector | null>(null)
   const [sequenceError, setSequenceError] = useState<string | null>(null)
   const [seedAttempt, setSeedAttempt] = useState(0)
@@ -15,9 +18,9 @@ export default function SessionWorkspacePage() {
     () =>
       sessionId
         ? new SessionTelemetryCollector(sessionId, {
-            callAction: (name, params) => callWorkerAction<unknown>(name, params),
-            isOnline: () => navigator.onLine,
-          })
+          callAction: (name, params) => callWorkerAction<unknown>(name, params),
+          isOnline: () => navigator.onLine,
+        })
         : null,
     [sessionId],
   )

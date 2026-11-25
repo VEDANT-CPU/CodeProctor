@@ -17,9 +17,6 @@ import {
   orderTelemetryEvents,
 } from '../domain/telemetry.js'
 import { projectTimelinePoints } from '../domain/timeline.js'
-import type { IncidentKind } from '../domain/incidents.js'
-import { aggregateIntegrityIncidents } from '../domain/incidents.js'
-import type { AiIncidentBrief, IncidentCitation } from '../domain/review.js'
 import type {
   CodeSnapshot,
   IngestionBatch,
@@ -191,6 +188,12 @@ function isNullableTimestamp(value: unknown): value is number | null | undefined
 }
 
 function isStoredAssessmentSession(value: unknown): value is StoredAssessmentSession {
+  const isValidConnected =
+    isObject(value) &&
+    (typeof value.isConnected === 'boolean' ||
+      value.isConnected === 0 ||
+      value.isConnected === 1 ||
+      value.isConnected === undefined)
   return (
     isObject(value) &&
     typeof value.id === 'string' &&
@@ -199,7 +202,7 @@ function isStoredAssessmentSession(value: unknown): value is StoredAssessmentSes
     isProblemPrompt(value.problem) &&
     typeof value.status === 'string' &&
     sessionStatuses.includes(value.status as SessionStatus) &&
-    typeof value.isConnected === 'boolean' &&
+    isValidConnected &&
     Number.isInteger(value.reconnectCount) &&
     typeof value.createdAt === 'number' &&
     Number.isFinite(value.createdAt) &&
@@ -248,16 +251,25 @@ async function loadSession(
   }
 
   const record = result.data.record
-  const isValidShape = isStoredAssessmentSession(record.data)
-  const idsMatch = isObject(record.data) && record.data.id === record.recordId && record.recordId === sessionId
-  if (!isValidShape || !idsMatch) {
-    console.warn('loadSession invalid record debug', {
-      sessionId,
-      recordId: record.recordId,
-      dataId: isObject(record.data) ? record.data.id : undefined,
-      isValidShape,
-      recordKeys: isObject(record) ? Object.keys(record) : typeof record,
-      dataKeys: isObject(record.data) ? Object.keys(record.data) : typeof record.data,
+  if (
+    !isStoredAssessmentSession(record.data) ||
+    record.data.id !== record.recordId ||
+    record.recordId !== sessionId
+  ) {
+    console.warn('loadSession invalid_session_record', { sessionId, recordId: record.recordId, dataId: record.data?.id, validShape: isStoredAssessmentSession(record.data), keys: Object.keys(record.data ?? {}) })
+    console.warn('loadSession shape debug', {
+      hasProblem: isProblemPrompt(record.data?.problem),
+      status: record.data?.status,
+      statusOk: typeof record.data?.status === 'string' && sessionStatuses.includes(record.data.status),
+      disposition: record.data?.disposition,
+      dispositionOk:
+        record.data?.disposition === undefined ||
+        (typeof record.data?.disposition === 'string' && reviewDispositions.includes(record.data.disposition)),
+      isConnected: typeof record.data?.isConnected,
+      reconnectCount: record.data?.reconnectCount,
+      createdAt: record.data?.createdAt,
+      expiresAt: record.data?.expiresAt,
+      problemSample: record.data?.problem,
     })
     return {
       success: false,
@@ -267,6 +279,7 @@ async function loadSession(
   const data = record.data
   const session: AssessmentSession = {
     ...data,
+    isConnected: Boolean(data.isConnected),
     startedAt: data.startedAt ?? null,
     submittedAt: data.submittedAt ?? null,
     lastSeenAt: data.lastSeenAt ?? null,
@@ -1204,207 +1217,6 @@ export const setSessionDisposition: ActionHandler<Env> = async (context) => {
   return { success: true, data: updatedSession }
 }
 
-export const requestAiOverview: ActionHandler<Env> = async (context) => {
-  const sessionId = context.params.sessionId
-  const incidentId = context.params.incidentId
-  const startSeq = context.params.startSeq
-  const endSeq = context.params.endSeq
-  const startTimestamp = context.params.startTimestamp
-  const endTimestamp = context.params.endTimestamp
-
-  if (typeof sessionId !== 'string' || !sessionId.trim()) return missingParam('sessionId')
-  if (incidentId !== undefined && (typeof incidentId !== 'string' || !incidentId.trim())) {
-    return missingParam('incidentId')
-  }
-  if (startSeq !== undefined && (typeof startSeq !== 'number' || !Number.isSafeInteger(startSeq) || startSeq < 1)) {
-    return missingParam('startSeq')
-  }
-  if (endSeq !== undefined && (typeof endSeq !== 'number' || !Number.isSafeInteger(endSeq) || endSeq < 1)) {
-    return missingParam('endSeq')
-  }
-  if (startTimestamp !== undefined && (typeof startTimestamp !== 'number' || !Number.isFinite(startTimestamp))) {
-    return missingParam('startTimestamp')
-  }
-  if (endTimestamp !== undefined && (typeof endTimestamp !== 'number' || !Number.isFinite(endTimestamp))) {
-    return missingParam('endTimestamp')
-  }
-
-  // 1. Resolve actor
-  const actorResult = await resolveActor(context)
-  if (isActionResult(actorResult)) return actorResult
-  const actor = actorResult.actor
-
-  // 2. Load session and project SessionContext
-  const loaded = await loadSession(context.tools, sessionId)
-  if (!loaded.success) return loaded.result
-  const sessionContext = toSessionContext(loaded.session)
-
-  // 3. Enforce authorization across all session statuses — candidates are forbidden
-  if (
-    !authorizeActorSession(actor, sessionContext) ||
-    !authorizeActorAction(actor, 'request_ai_overview', sessionContext)
-  ) {
-    return failure('Forbidden', 'forbidden')
-  }
-
-  // 4. Query telemetry-events and code-snapshots in parallel
-  const [telemetryResult, snapshotResult] = await Promise.all([
-    context.tools.query<Record<string, unknown>>(TELEMETRY_COLLECTION, {
-      where: { sessionId },
-      orderBy: 'seq',
-      orderDir: 'asc',
-    }),
-    context.tools.query<Record<string, unknown>>(SNAPSHOT_COLLECTION, {
-      where: { sessionId },
-      orderBy: 'seq',
-      orderDir: 'asc',
-    }),
-  ])
-  if (!telemetryResult.success) return telemetryResult
-  if (!snapshotResult.success) return snapshotResult
-
-  // Validate and collect persisted events/snapshots
-  const telemetryEvents: PersistedTelemetryEvent[] = []
-  for (const record of telemetryResult.data.records) {
-    const data = record.data
-    if (
-      record.recordId !== `${sessionId}:${String(data.seq)}` ||
-      !isPersistedTelemetryEvent(data) ||
-      data.sessionId !== sessionId ||
-      data.candidateId !== loaded.session.candidateId
-    ) {
-      return failure('Stored telemetry record is invalid', 'invalid_timeline_record')
-    }
-    telemetryEvents.push(data)
-  }
-
-  const codeSnapshots: PersistedCodeSnapshot[] = []
-  for (const record of snapshotResult.data.records) {
-    if (
-      record.recordId !== `${sessionId}:${String(record.data.seq)}` ||
-      !isPersistedCodeSnapshot(record.data) ||
-      record.data.sessionId !== sessionId ||
-      record.data.candidateId !== loaded.session.candidateId
-    ) {
-      return failure('Stored code snapshot is invalid', 'invalid_timeline_record')
-    }
-    codeSnapshots.push(record.data)
-  }
-
-  // 5. Project timeline points (merges and seq-orders both streams)
-  const allPoints = projectTimelinePoints(telemetryEvents, codeSnapshots)
-
-  // 6. Safely derive window bounds — guard against empty histories (no NaN or ±Infinity)
-  const minSeqInHistory = allPoints.length > 0 ? allPoints[0].seq : 1
-  const maxSeqInHistory = allPoints.length > 0 ? allPoints[allPoints.length - 1].seq : 1
-  const minTsInHistory = allPoints.length > 0 ? allPoints[0].clientTimestamp : 0
-  const maxTsInHistory = allPoints.length > 0 ? allPoints[allPoints.length - 1].clientTimestamp : 0
-
-  const windowStartSeq = typeof startSeq === 'number' ? startSeq : minSeqInHistory
-  const windowEndSeq = typeof endSeq === 'number' ? endSeq : maxSeqInHistory
-  const windowStartTs = typeof startTimestamp === 'number' ? startTimestamp : minTsInHistory
-  const windowEndTs = typeof endTimestamp === 'number' ? endTimestamp : maxTsInHistory
-
-  // 7. Apply optional seq/timestamp bounds to restrict timeline window
-  const windowedPoints = allPoints.filter(
-    (point) =>
-      point.seq >= windowStartSeq &&
-      point.seq <= windowEndSeq &&
-      point.clientTimestamp >= windowStartTs &&
-      point.clientTimestamp <= windowEndTs,
-  )
-
-  // 8. Resolve incidentKind if incidentId is passed
-  let resolvedIncidentKind: IncidentKind | undefined
-  if (incidentId) {
-    const incidents = aggregateIntegrityIncidents(
-      windowedPoints.filter((p) => p.kind === 'telemetry').map((p) => {
-        // Strip the 'kind' discriminator so we pass plain TelemetryEvent objects
-        const { kind: _kind, ...event } = p as typeof p & { kind: 'telemetry' }
-        return event as PersistedTelemetryEvent
-      }),
-    )
-    const matched = incidents.find((inc) => inc.id === incidentId)
-    if (matched) resolvedIncidentKind = matched.kind
-  }
-
-  // 9. Build IncidentCitation[] from windowed telemetry events and snapshots
-  const citations: IncidentCitation[] = []
-
-  for (const point of windowedPoints) {
-    if (point.kind === 'telemetry') {
-      const eventType = (point as PersistedTelemetryEvent & { kind: 'telemetry' }).type
-      if (
-        eventType === 'FOCUS_LOST' ||
-        eventType === 'LARGE_PASTE' ||
-        eventType === 'FOCUS_RESTORED' ||
-        eventType === 'CONNECTION_LOST' ||
-        eventType === 'CONNECTION_RECOVERED'
-      ) {
-        citations.push({
-          source: 'telemetry_event',
-          sessionId,
-          seq: point.seq,
-          timestamp: point.clientTimestamp,
-          eventType,
-        })
-      } else if (eventType === 'CODE_EDIT') {
-        citations.push({
-          source: 'code_diff',
-          sessionId,
-          seq: point.seq,
-          timestamp: point.clientTimestamp,
-        })
-      }
-    } else if (point.kind === 'snapshot') {
-      const snap = point as PersistedCodeSnapshot & { kind: 'snapshot' }
-      citations.push({
-        source: 'snapshot',
-        sessionId,
-        seq: point.seq,
-        timestamp: point.clientTimestamp,
-        snapshotId: snap.snapshotId,
-      })
-    }
-  }
-
-  // 10. Compose and return AiIncidentBrief
-  const now = Date.now()
-  const brief: AiIncidentBrief = {
-    id: crypto.randomUUID(),
-    sessionId,
-    ...(incidentId ? { incidentId } : {}),
-    startSeq: windowStartSeq,
-    endSeq: windowEndSeq,
-    startTimestamp: windowStartTs,
-    endTimestamp: windowEndTs,
-    ...(resolvedIncidentKind ? { incidentKind: resolvedIncidentKind } : {}),
-    summary: buildAiOverviewSummary(windowedPoints.length, citations.length, resolvedIncidentKind),
-    citations,
-    generatedAt: now,
-  }
-
-  return { success: true, data: brief }
-}
-
-function buildAiOverviewSummary(
-  totalPoints: number,
-  citationCount: number,
-  incidentKind: IncidentKind | undefined,
-): string {
-  if (totalPoints === 0) {
-    return 'No telemetry or code snapshots were recorded in the requested window.'
-  }
-  const kindLabel = incidentKind
-    ? ` Related incident kind: ${incidentKind}.`
-    : ''
-  return (
-    `Review window contains ${totalPoints} timeline point(s) with ${citationCount} citation(s).` +
-    kindLabel +
-    ' This triage brief is grounded in browser-level telemetry signals only and is not evidence of misconduct.'
-  )
-}
-
 export const assessmentSessionActions: Record<string, ActionHandler<Env>> = {
   create_assessment_session: createAssessmentSession,
   get_assessment_session: getAssessmentSession,
@@ -1419,5 +1231,4 @@ export const assessmentSessionActions: Record<string, ActionHandler<Env>> = {
   add_proctor_annotation: addProctorAnnotation,
   get_session_annotations: getSessionAnnotations,
   set_session_disposition: setSessionDisposition,
-  request_ai_overview: requestAiOverview,
 }
